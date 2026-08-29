@@ -162,6 +162,58 @@ uv run python client.py \
   --execute --allow-live
 ```
 
+## Web UI
+
+`web_server.py` is a single-page HTML form over the exact same
+`client.py`/`compliance/` logic the CLI uses - same compliance gate,
+same masking, same result shape. Reuses no new business logic; it is
+purely an HTTP layer.
+
+```bash
+uv run python web_server.py
+```
+
+Then open `http://127.0.0.1:8000/`. `--allow-live` and the API key are
+both **server-startup** concerns, never a browser control: there is no
+`--allow-live` checkbox and no API-key field in the form.
+`CALLE_API_KEY` is read from the server process's own environment,
+exactly like the CLI, and only when the server was started with
+`--allow-live` against the real API base URL.
+
+No authentication, no accounts, no database: this is a local,
+single-operator tool. It binds to `127.0.0.1` by default - do not expose
+it beyond localhost without adding auth first. `--execute` mode blocks
+the HTTP response for the whole poll duration (up to 120s) since there
+is no background job or websocket layer - an accepted trade-off for
+"facade, not a platform."
+
+## Public demo deployment
+
+`public_demo_server.py` is a separate, deliberately non-configurable
+entry point for hosting a public read-only-ish demo (for example on
+Render): it starts its own internal fake CALL-E backend
+(`fake_server.FakeCalleServer`, bound to `127.0.0.1` only - never
+reachable from outside the process) and points the same `web_server.py`
+UI at it.
+
+**Safety, stated plainly**: the public demo link is dry-run and
+fake-server-execute only. `public_demo_server.py` hardcodes
+`allow_live=False` in code - there is no flag, environment variable, or
+hosting-dashboard setting that turns it on - and it always targets the
+internal fake backend, never `https://api.heycall-e.com`. Do not set
+`CALLE_API_KEY` in this service's environment; it would sit unused given
+the above, but there is no reason for a real credential to exist in a
+public demo's configuration at all.
+
+To deploy on Render: create a new Web Service from your fork, set
+**Root Directory** to `apps/python/compliance-gated-callback`, and
+Render picks up `render.yaml` automatically (free plan, Python runtime).
+
+Two free-tier trade-offs worth knowing: there is no rate limiting on the
+form (acceptable here since nothing reachable has a real-world cost or a
+real credential behind it), and Render's free tier spins down on
+inactivity, so the first request after idle can be slow.
+
 ## Adding a jurisdiction
 
 1. Create `compliance/jurisdictions/<id>.py` with a `RULES` object

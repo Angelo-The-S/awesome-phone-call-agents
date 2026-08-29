@@ -12,7 +12,7 @@ from http.client import HTTPConnection
 from urllib.parse import urlencode
 
 from fake_server import FakeCalleServer
-from web_server import Handler
+from web_server import Handler, parse_server_args
 
 from http.server import ThreadingHTTPServer
 
@@ -162,3 +162,15 @@ def test_server_without_allow_live_still_executes_against_fake_base_url() -> Non
         assert status == 200
         assert "Created call" in body
         assert server.creates == 1
+
+
+def test_parse_server_args_port_defaults_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("PORT", "9999")
+    args = parse_server_args([])
+    assert args.port == 9999
+
+
+def test_parse_server_args_port_defaults_to_8000_without_env(monkeypatch) -> None:
+    monkeypatch.delenv("PORT", raising=False)
+    args = parse_server_args([])
+    assert args.port == 8000

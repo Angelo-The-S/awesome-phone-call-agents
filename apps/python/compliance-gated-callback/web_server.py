@@ -248,7 +248,12 @@ class Handler(BaseHTTPRequestHandler):
 def parse_server_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal web facade for compliance-gated-callback.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address. Never expose beyond localhost.")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", 8000)),
+        help="Defaults to the PORT environment variable (Render/Heroku convention) or 8000.",
+    )
     parser.add_argument("--base-url", default=os.environ.get("CALLE_API_BASE_URL", REAL_API_BASE_URL))
     parser.add_argument(
         "--allow-live",
