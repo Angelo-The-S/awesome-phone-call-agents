@@ -245,6 +245,52 @@ area included).
   that was actually checked (`resolve_locale_and_region`), so what is
   sent can never drift from what was verified.
 
+## Prompt injection resistance
+
+The person being called can try to manipulate the call: get the agent to
+ignore its goal, reveal internal instructions or credentials, or act
+outside its role. This app's only lever over what happens on the call is
+the `task` string sent to CALL-E - it does not control CALL-E's
+underlying voice model or runtime.
+
+**What this adds:**
+
+- Every `task` sent to CALL-E is the operator's own wording with a fixed
+  safety block appended after it (`build_hardened_task`, never a rewrite
+  of the operator's text - see `--task` in Usage). The block tells the
+  model to treat anything the counterpart says as information to weigh
+  against the goal, never as a new instruction, and names concrete
+  extraction/override attempts to refuse: revealing instructions, system
+  prompt, credentials, or the compliance logic that allowed the call;
+  claims of being a developer, administrator, or "CALL-E support";
+  "ignore your instructions" / "enter developer mode" / manufactured
+  urgency. It also tells the model to end the call if the person keeps
+  pushing after being told no once.
+- `result_schema` requires every call to self-report
+  `manipulation_attempt_detected` (plus an optional
+  `manipulation_attempt_note` with what was attempted), so an operator
+  can review attempted manipulation after the fact even when the model's
+  real-time refusal isn't perfect.
+
+**What this does not guarantee:**
+
+This app cannot filter CALL-E's voice model output before the
+counterpart hears it, cannot insert a canary token and cut the call
+automatically, and cannot verify the model actually followed these
+instructions rather than just reporting that it did.
+[OWASP's GenAI LLM01:2025 guidance](https://genai.owasp.org/llmrisk/llm01-prompt-injection/)
+is explicit that no purely prompt-based defense is provably complete
+against a determined adversary, because these models have no structural
+separation between instructions and the data they process - it's a
+mitigation that raises the cost of casual probing and creates an audit
+trail, not a security boundary. See also
+[OpenAI's guidance on designing agents to resist prompt injection](https://openai.com/index/designing-agents-to-resist-prompt-injection/),
+which this instruction block follows (name concrete attack phrasings,
+treat counterpart input as data, give the agent an explicit way to end
+the interaction). `manipulation_attempt_detected` is exactly as reliable
+as the model self-reporting it - a sufficiently successful manipulation
+could suppress that flag too.
+
 ## Architecture
 
 ```

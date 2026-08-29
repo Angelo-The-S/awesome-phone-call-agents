@@ -85,9 +85,10 @@ def structured_result_for(result_schema: dict[str, Any] | None) -> dict[str, Any
     server has no call evidence, so it returns a fixed value taken from the
     schema's own enums when the shape matches this app's intent schema, and
     None otherwise (matching the documented "null when no result_schema was
-    provided or extraction failed" behavior). Fills next_action and
-    confidence_note too, when the schema declares them, so the fake server
-    exercises the full result shape end to end.
+    provided or extraction failed" behavior). Fills next_action,
+    confidence_note, and manipulation_attempt_detected too, when the
+    schema declares them, so the fake server exercises the full result
+    shape end to end.
     """
     if not result_schema:
         return None
@@ -110,6 +111,11 @@ def structured_result_for(result_schema: dict[str, Any] | None) -> dict[str, Any
         result["confidence_note"] = (
             "Fake server: deterministic canned result, not extracted from real call evidence."
         )
+
+    if "manipulation_attempt_detected" in properties:
+        # The fake server has no real call evidence of an attack, so it
+        # always reports none.
+        result["manipulation_attempt_detected"] = False
 
     return result
 
