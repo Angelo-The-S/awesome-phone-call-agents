@@ -28,6 +28,8 @@ from pathlib import Path
 import pytest
 
 from client import (
+    BUSINESS_CONTEXT_HEADER,
+    MAX_BUSINESS_CONTEXT_CHARS,
     REAL_API_BASE_URL,
     TASK_INJECTION_RESISTANCE_INSTRUCTIONS,
     CallEAPIError,
@@ -37,6 +39,7 @@ from client import (
     build_recipient,
     default_intent_result_schema,
     mask_phone,
+    validate_business_context,
 )
 from fake_server import INSUFFICIENT_BALANCE_PHONE, RATE_LIMITED_ONCE_PHONE, FakeCalleServer
 
@@ -350,6 +353,73 @@ def test_cli_execute_stops_without_retry_on_ambiguous_connection_failure() -> No
     assert elapsed < 5.0
 
 
+def test_build_hardened_task_without_business_context_is_unchanged() -> None:
+    operator_task = "Call the recipient and find out why they are calling in."
+    assert build_hardened_task(operator_task) == f"{operator_task}\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
+
+
+def test_build_hardened_task_orders_context_before_task_before_resistance_block() -> None:
+    operator_task = "Call the recipient and find out why they are calling in."
+    business_context = "Bright Smile Dental is open Monday-Friday 8am-5pm."
+    result = build_hardened_task(operator_task, business_context)
+
+    context_index = result.index(business_context)
+    task_index = result.index(operator_task)
+    resistance_index = result.index(TASK_INJECTION_RESISTANCE_INSTRUCTIONS)
+    assert context_index < task_index < resistance_index
+
+
+def test_build_hardened_task_business_context_is_a_separate_block() -> None:
+    operator_task = "Call the recipient and find out why they are calling in."
+    business_context = "Bright Smile Dental is open Monday-Friday 8am-5pm."
+    result = build_hardened_task(operator_task, business_context)
+
+    expected = (
+        f"{BUSINESS_CONTEXT_HEADER}\n{business_context}"
+        f"\n\n{operator_task}"
+        f"\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
+    )
+    assert result == expected
+
+
+def test_validate_business_context_empty_or_none_returns_none() -> None:
+    assert validate_business_context(None) is None
+    assert validate_business_context("") is None
+    assert validate_business_context("   \n\t  ") is None
+
+
+def test_validate_business_context_strips_whitespace() -> None:
+    assert validate_business_context("  hello  \n") == "hello"
+
+
+def test_validate_business_context_at_limit_is_accepted() -> None:
+    text = "a" * MAX_BUSINESS_CONTEXT_CHARS
+    assert validate_business_context(text) == text
+
+
+def test_validate_business_context_over_limit_raises_value_error() -> None:
+    text = "a" * (MAX_BUSINESS_CONTEXT_CHARS + 1)
+    with pytest.raises(ValueError) as exc_info:
+        validate_business_context(text)
+    message = str(exc_info.value)
+    assert str(MAX_BUSINESS_CONTEXT_CHARS + 1) in message
+    assert "refuses to silently truncate" in message
+
+
+def test_default_intent_result_schema_topic_handled_is_optional() -> None:
+    schema = default_intent_result_schema()
+    assert "topic_handled" in schema["properties"]
+    assert "topic_handled" not in schema["required"]
+    assert schema["properties"]["topic_handled"]["enum"] == [
+        "pricing",
+        "scheduling",
+        "general_info",
+        "service_details",
+        "out_of_scope",
+        "unknown",
+    ]
+
+
 def test_cli_task_is_hardened_with_injection_resistance_instructions() -> None:
     """The operator's own task text and the fixed safety block must both
     appear in the printed request body - additive, not a rewrite.
@@ -386,6 +456,64 @@ def test_cli_execute_result_includes_manipulation_flag() -> None:
 
         assert result.returncode == 0, result.stderr
         assert '"manipulation_attempt_detected": false' in result.stdout
+
+
+def test_cli_dry_run_business_context_appears_before_operator_task() -> None:
+    operator_task = "Call the recipient and find out why they are calling in."
+    business_context = "Bright Smile Dental is open Monday-Friday 8am-5pm."
+    with FakeCalleServer() as server:
+        result = _run_cli(
+            server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--business-context", business_context]
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert business_context in result.stdout
+        assert result.stdout.index(business_context) < result.stdout.index(operator_task)
+
+
+def test_cli_dry_run_business_context_from_file(tmp_path) -> None:
+    business_context = "Bright Smile Dental is open Monday-Friday 8am-5pm."
+    context_file = tmp_path / "business_context.txt"
+    context_file.write_text(business_context, encoding="utf-8")
+    with FakeCalleServer() as server:
+        result = _run_cli(
+            server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--business-context-file", str(context_file)]
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert business_context in result.stdout
+
+
+def test_cli_business_context_and_file_together_is_rejected() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(
+            server.base_url,
+            FR_PHONE,
+            [*FR_COMPLIANT_FLAGS, "--business-context", "x", "--business-context-file", "some_file.txt"],
+        )
+
+        assert result.returncode == 2
+        assert "not allowed with" in result.stderr
+
+
+def test_cli_business_context_over_limit_blocks_before_sending() -> None:
+    oversized = "a" * (MAX_BUSINESS_CONTEXT_CHARS + 1)
+    with FakeCalleServer() as server:
+        result = _run_cli(
+            server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--execute", "--business-context", oversized]
+        )
+
+        assert result.returncode == 1
+        assert str(MAX_BUSINESS_CONTEXT_CHARS + 1) in result.stderr
+        assert server.creates == 0
+
+
+def test_cli_empty_business_context_behaves_as_before() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--business-context", ""])
+
+        assert result.returncode == 0, result.stderr
+        assert BUSINESS_CONTEXT_HEADER not in result.stdout
 
 
 def test_cli_dry_run_oregon_compliant_shows_state_variation() -> None:

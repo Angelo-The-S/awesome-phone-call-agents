@@ -11,6 +11,7 @@ import threading
 from http.client import HTTPConnection
 from urllib.parse import urlencode
 
+from client import MAX_BUSINESS_CONTEXT_CHARS
 from fake_server import FakeCalleServer
 from web_server import Handler, parse_server_args
 
@@ -101,6 +102,7 @@ def test_get_form_page_lists_expected_fields() -> None:
             'name="gdpr_basis_documented"',
             'name="recipient_timezone"',
             'name="intends_to_record"',
+            'name="business_context"',
             'name="mode"',
         ):
             assert field in body
@@ -140,6 +142,25 @@ def test_post_fr_compliant_execute_places_call_and_shows_result() -> None:
         assert "has no cancel endpoint" in body
         assert "C31" in body
         assert "manipulation_attempt_detected" in body
+
+
+def test_post_with_business_context_appears_in_request_body() -> None:
+    business_context = "Bright Smile Dental is open Monday-Friday 8am-5pm."
+    with FakeCalleServer() as server, WebServerHandle(server.base_url) as web:
+        fields = {"phone": FR_PHONE, "task": OPERATOR_TASK, "mode": "dry_run", "business_context": business_context}
+        status, body = web.post_form(fields)
+        assert status == 200
+        assert business_context in body
+
+
+def test_post_business_context_over_limit_returns_400() -> None:
+    oversized = "a" * (MAX_BUSINESS_CONTEXT_CHARS + 1)
+    with FakeCalleServer() as server, WebServerHandle(server.base_url) as web:
+        fields = {"phone": FR_PHONE, "task": OPERATOR_TASK, "mode": "dry_run", "business_context": oversized}
+        status, body = web.post_form(fields)
+        assert status == 400
+        assert str(MAX_BUSINESS_CONTEXT_CHARS + 1) in body
+        assert server.creates == 0
 
 
 def test_post_escapes_html_in_task_field() -> None:

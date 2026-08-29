@@ -239,6 +239,65 @@ uv run python client.py \
   --execute --allow-live
 ```
 
+## Business context injection
+
+CALL-E can answer several different kinds of questions in one call
+(pricing, hours, appointment availability, general questions about the
+business) using a single agent, instead of a separate specialized agent
+per topic - as long as it has the business's own facts to draw on.
+`--business-context` / `--business-context-file` (CLI) and the
+"Business context" field (web form) give it that: free text describing
+services, prices, hours, and FAQs, injected into the `task` sent to
+CALL-E. This is a simple text injection, not a retrieval/vector-search
+system - the whole text goes into the task on every call.
+
+The final task sent to CALL-E is always three distinct, delimited
+blocks, in this fixed order, never merged into one paragraph:
+
+```
+[Business context, if provided] + [Operator's own --task] + [Injection-resistance safety block]
+```
+
+`build_hardened_task(operator_task, business_context)` in `client.py`
+builds this. The business context block is explicitly labeled as
+reference material, not instructions - the same "additive, never a
+rewrite" principle already used for the injection-resistance block (see
+Prompt injection resistance below).
+
+Rules:
+- Providing business context is optional and never a compliance
+  concern: an empty or absent context does not block the call, and
+  behavior is unchanged from before this feature existed.
+- Text is capped at 4000 characters (`MAX_BUSINESS_CONTEXT_CHARS` in
+  `client.py`). Going over the limit is a clear error
+  (`validate_business_context` raises `ValueError`), never a silent
+  truncation - CALL-E should never receive a business description that
+  was quietly cut off mid-sentence.
+- `--business-context` (inline text) and `--business-context-file` (a
+  UTF-8 text file path) are mutually exclusive on the CLI. The web form
+  only offers a text field to paste into directly - no file upload.
+
+`business_context_example.txt` is a filled-in example for a fictional
+dental practice, Bright Smile Dental, with fictional prices, hours, and
+FAQs - use it as a template, or to demonstrate one agent handling
+several topics (pricing, scheduling, general info) in the same call:
+
+```bash
+uv run python client.py \
+  --task "Answer the recipient's questions about our practice." \
+  --phone +12025550123 \
+  --consent-obtained --consent-timestamp 2026-08-20T12:00:00Z \
+  --dnc-checked \
+  --recipient-timezone America/New_York \
+  --business-context-file business_context_example.txt
+```
+
+`result_schema`'s optional `topic_handled` field
+(`pricing | scheduling | general_info | service_details | out_of_scope | unknown`)
+records after the fact which kind of question the call actually
+covered - useful for showing the same agent handled more than one topic
+type across calls.
+
 ## Web UI
 
 `web_server.py` is a single-page HTML form over the exact same
@@ -335,6 +394,11 @@ another US jurisdiction rather than a country code.
 - Every phone number is masked to its last 4 digits (`mask_phone`) in
   every preview, error message, and result this app prints; the
   unmasked number is still what is actually sent to the API.
+- Optional business context (`--business-context`/`--business-context-file`
+  or the web form field) is size-capped at 4000 characters, fails loudly
+  instead of silently truncating when over that limit, and is always
+  sent as a separate, clearly labeled block from the operator's own task
+  text - never merged into one string. See Business context injection.
 - The full request body is printed before it is sent, on every run,
   dry-run or execute - there is no call this app can place silently.
 - The `Idempotency-Key` sent with every real call is always derived from

@@ -45,6 +45,7 @@ from client import (
     redacted_call_for_display,
     redacted_recipient_for_display,
     resolve_api_key,
+    validate_business_context,
 )
 from compliance.dispatcher import resolve_locale_and_region, run_precall_checks
 from compliance.models import PreCallContext, compute_consent_retention_expiry
@@ -58,6 +59,8 @@ FORM_PAGE = """<!doctype html>
 <form method="post" action="/">
   <p><label>Phone number (E.164)<br><input type="text" name="phone" placeholder="+33639980456" required></label></p>
   <p><label>Call objective<br><textarea name="task" rows="3" cols="60" required></textarea></label></p>
+  <p><label>Business context (optional, pasted directly - services, pricing, hours, FAQs)<br>
+     <textarea name="business_context" rows="4" cols="60"></textarea></label></p>
   <p><label><input type="checkbox" name="consent_obtained" value="1"> Consent obtained</label><br>
      <label>Consent timestamp (ISO 8601 UTC, optional - defaults to now)<br>
        <input type="text" name="consent_timestamp" placeholder="2026-08-20T12:00:00Z"></label></p>
@@ -172,6 +175,7 @@ class Handler(BaseHTTPRequestHandler):
         consent_timestamp_raw = _first(form, "consent_timestamp")
         now_utc_raw = _first(form, "now_utc")
         solicitations_raw = _first(form, "solicitations_in_last_24h")
+        business_context_raw = _first(form, "business_context") or None
 
         try:
             consent_timestamp = (
@@ -181,6 +185,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             now_utc = parse_utc_timestamp(now_utc_raw) if now_utc_raw else None
             solicitations_in_last_24h = int(solicitations_raw) if solicitations_raw else None
+            business_context = validate_business_context(business_context_raw)
         except (argparse.ArgumentTypeError, ValueError) as exc:
             self._send_html(400, PAGE_TEMPLATE.format(body=f"<p>Invalid input: {_escape(exc)}</p>"))
             return
@@ -205,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(400, PAGE_TEMPLATE.format(body=f"<p>{_escape(exc)}</p>"))
             return
 
-        hardened_task = build_hardened_task(task)
+        hardened_task = build_hardened_task(task, business_context)
         body_preview = {
             "task": hardened_task,
             "recipients": [redacted_recipient_for_display(recipient)],
