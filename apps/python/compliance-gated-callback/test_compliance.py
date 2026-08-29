@@ -24,7 +24,7 @@ from compliance.dispatcher import (
     resolve_locale_and_region,
     run_precall_checks,
 )
-from compliance.models import ConfidenceLevel, PreCallContext
+from compliance.models import ConfidenceLevel, PreCallContext, compute_consent_retention_expiry
 
 # --- US federal fixtures -----------------------------------------------
 
@@ -57,6 +57,23 @@ FR_COMPLIANT_CONTEXT = PreCallContext(
     gdpr_basis_documented=True,
     recipient_timezone=FR_TIMEZONE,
     now_utc=FR_TUESDAY_MORNING_NOW,
+)
+
+# --- Oregon (+ us_federal) fixtures -------------------------------------
+
+OREGON_PHONE = "+15035550100"  # NANP reserved block NPA-555-01XX, Oregon area code 503
+OREGON_TIMEZONE = "America/Los_Angeles"  # UTC-7 (PDT) in August
+OREGON_IN_WINDOW_NOW = datetime(2026, 8, 25, 19, 0, tzinfo=UTC)  # 12:00 local Portland, within 8-20
+OREGON_OUTSIDE_WINDOW_NOW = datetime(2026, 8, 26, 4, 0, tzinfo=UTC)  # 21:00 local Portland on Aug 25, outside 8-20
+
+OREGON_COMPLIANT_CONTEXT = PreCallContext(
+    phone_e164=OREGON_PHONE,
+    consent_obtained=True,
+    consent_timestamp=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+    dnc_checked=True,
+    recipient_timezone=OREGON_TIMEZONE,
+    now_utc=OREGON_IN_WINDOW_NOW,
+    solicitations_in_last_24h=0,
 )
 
 
@@ -232,3 +249,82 @@ def test_eu_common_consent_check_is_medium_confidence_regardless_of_outcome() ->
     blocked_decision = run_precall_checks(replace(FR_COMPLIANT_CONTEXT, consent_obtained=False))
     failing_consent = [r for r in blocked_decision.results if r.check_name == "eu_common_consent"][0]
     assert failing_consent.confidence == ConfidenceLevel.MEDIUM
+
+
+# --- Oregon: first US state-level variation, routed by area code --------
+
+
+def test_oregon_area_code_resolves_to_us_federal_then_us_oregon() -> None:
+    assert resolve_jurisdiction_chain(OREGON_PHONE) == ("us_federal", "us_oregon")
+
+
+def test_non_oregon_us_number_still_resolves_to_us_federal_only() -> None:
+    assert resolve_jurisdiction_chain(US_PHONE) == ("us_federal",)
+
+
+def test_resolve_locale_and_region_for_oregon() -> None:
+    assert resolve_locale_and_region(("us_federal", "us_oregon")) == ("en-US", "US")
+
+
+def test_oregon_fully_compliant_context_is_allowed() -> None:
+    decision = run_precall_checks(OREGON_COMPLIANT_CONTEXT)
+    assert decision.allowed is True
+    assert decision.jurisdiction_chain == ("us_federal", "us_oregon")
+    assert all(r.passed for r in decision.results)
+
+
+def test_oregon_outside_window_blocks() -> None:
+    context = replace(OREGON_COMPLIANT_CONTEXT, now_utc=OREGON_OUTSIDE_WINDOW_NOW)
+    decision = run_precall_checks(context)
+    assert decision.allowed is False
+    assert "outside" in reasons_for(decision, "us_oregon_calling_window")[0]
+
+
+def test_oregon_solicitation_cap_missing_blocks() -> None:
+    context = replace(OREGON_COMPLIANT_CONTEXT, solicitations_in_last_24h=None)
+    decision = run_precall_checks(context)
+    assert decision.allowed is False
+    assert "not attested" in reasons_for(decision, "us_oregon_solicitation_cap")[0]
+
+
+def test_oregon_solicitation_cap_at_limit_blocks() -> None:
+    context = replace(OREGON_COMPLIANT_CONTEXT, solicitations_in_last_24h=3)
+    decision = run_precall_checks(context)
+    assert decision.allowed is False
+    assert "already recorded" in reasons_for(decision, "us_oregon_solicitation_cap")[0]
+
+
+def test_oregon_solicitation_cap_under_limit_passes() -> None:
+    context = replace(OREGON_COMPLIANT_CONTEXT, solicitations_in_last_24h=2)
+    decision = run_precall_checks(context)
+    cap_result = [r for r in decision.results if r.check_name == "us_oregon_solicitation_cap"][0]
+    assert cap_result.passed is True
+
+
+def test_oregon_revocation_blocks() -> None:
+    context = replace(OREGON_COMPLIANT_CONTEXT, do_not_call_requested=True)
+    decision = run_precall_checks(context)
+    assert decision.allowed is False
+    assert reasons_for(decision, "us_oregon_revocation")
+
+
+# --- Consent-record retention (FTC TSR / Germany UWG Sec. 7a) -----------
+
+
+def test_compute_consent_retention_expiry_anchors_on_later_call_time() -> None:
+    consent = datetime(2026, 1, 1, tzinfo=UTC)
+    call = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+    assert compute_consent_retention_expiry(consent, call) == datetime(2031, 8, 20, 12, 0, tzinfo=UTC)
+
+
+def test_compute_consent_retention_expiry_anchors_on_later_consent_time() -> None:
+    consent = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+    call = datetime(2026, 1, 1, tzinfo=UTC)
+    assert compute_consent_retention_expiry(consent, call) == datetime(2031, 8, 20, 12, 0, tzinfo=UTC)
+
+
+def test_compute_consent_retention_expiry_handles_leap_day_anchor() -> None:
+    consent = datetime(2028, 2, 29, 12, 0, tzinfo=UTC)  # 2028 is a leap year
+    call = datetime(2028, 1, 1, tzinfo=UTC)
+    # 2033 is not a leap year, so Feb 29 falls back to Feb 28.
+    assert compute_consent_retention_expiry(consent, call) == datetime(2033, 2, 28, 12, 0, tzinfo=UTC)

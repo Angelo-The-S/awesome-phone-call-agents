@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from compliance.dispatcher import resolve_locale_and_region, run_precall_checks
-from compliance.models import PreCallContext, PreCallDecision
+from compliance.models import PreCallContext, PreCallDecision, compute_consent_retention_expiry
 
 REAL_API_BASE_URL = "https://api.heycall-e.com"
 DEFAULT_BASE_URL = os.environ.get("CALLE_API_BASE_URL", REAL_API_BASE_URL)
@@ -503,6 +503,22 @@ def print_compliance_decision(decision: PreCallDecision) -> None:
     print(f"Compliance gate: allowed={decision.allowed}", flush=True)
 
 
+def print_consent_retention(context: PreCallContext) -> None:
+    """Informational only - does not gate the compliance decision. See
+    compute_consent_retention_expiry's docstring for FTC TSR / UWG Sec.
+    7a sourcing.
+    """
+    if context.consent_timestamp is None:
+        return
+    reference_time = context.now_utc or datetime.now(timezone.utc)
+    expiry = compute_consent_retention_expiry(context.consent_timestamp, reference_time)
+    print(
+        f"Consent record retention: keep this consent record until {expiry.isoformat()} "
+        "(FTC TSR 16 CFR 310.5 / Germany UWG Sec. 7a - informational, not sent to CALL-E)",
+        flush=True,
+    )
+
+
 def parse_utc_timestamp(value: str) -> datetime:
     text = value.strip()
     if text.endswith("Z"):
@@ -553,6 +569,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--intends-to-record", action="store_true")
     parser.add_argument(
+        "--solicitations-in-last-24h",
+        type=int,
+        default=None,
+        help="Number of prior calls+texts to this recipient in the last 24h, from your own "
+        "records. Required for Oregon numbers (HB 3865 caps this at 3); has no effect "
+        "elsewhere.",
+    )
+    parser.add_argument(
         "--now-utc",
         type=parse_utc_timestamp,
         default=None,
@@ -577,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
         gdpr_basis_documented=args.gdpr_basis_documented,
         recipient_timezone=args.recipient_timezone,
         now_utc=args.now_utc,
+        solicitations_in_last_24h=args.solicitations_in_last_24h,
     )
     decision = run_precall_checks(context)
     locale, region = resolve_locale_and_region(decision.jurisdiction_chain)
@@ -596,6 +621,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Mode: {'EXECUTE' if args.execute else 'DRY-RUN'}", flush=True)
     print_compliance_decision(decision)
+    print_consent_retention(context)
     print("Request body:", flush=True)
     print(json.dumps(body_preview, indent=2), flush=True)
 

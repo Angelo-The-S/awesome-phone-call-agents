@@ -47,7 +47,7 @@ from client import (
     resolve_api_key,
 )
 from compliance.dispatcher import resolve_locale_and_region, run_precall_checks
-from compliance.models import PreCallContext
+from compliance.models import PreCallContext, compute_consent_retention_expiry
 
 FORM_PAGE = """<!doctype html>
 <html lang="en">
@@ -65,6 +65,8 @@ FORM_PAGE = """<!doctype html>
   <p><label><input type="checkbox" name="gdpr_basis_documented" value="1"> GDPR lawful basis documented (EU numbers)</label></p>
   <p><label>Recipient timezone (IANA name)<br><input type="text" name="recipient_timezone" placeholder="Europe/Paris"></label></p>
   <p><label><input type="checkbox" name="intends_to_record" value="1"> Intends to record</label></p>
+  <p><label>Solicitations to this recipient in the last 24h, calls+texts (required for Oregon numbers)<br>
+     <input type="text" name="solicitations_in_last_24h" placeholder="0"></label></p>
   <p>Mode:
      <label><input type="radio" name="mode" value="dry_run" checked> Dry-run</label>
      <label><input type="radio" name="mode" value="execute"> Execute</label></p>
@@ -111,6 +113,22 @@ def render_compliance_section(decision) -> str:
     return "\n".join(lines)
 
 
+def render_consent_retention_section(context: PreCallContext) -> str | None:
+    """Informational only - does not gate the compliance decision. See
+    compute_consent_retention_expiry's docstring for FTC TSR / UWG Sec.
+    7a sourcing.
+    """
+    if context.consent_timestamp is None:
+        return None
+    reference_time = context.now_utc or datetime.now(timezone.utc)
+    expiry = compute_consent_retention_expiry(context.consent_timestamp, reference_time)
+    return (
+        f"<p>Consent record retention: keep this consent record until "
+        f"{_escape(expiry.isoformat())} (FTC TSR 16 CFR 310.5 / Germany UWG Sec. 7a - "
+        "informational, not sent to CALL-E)</p>"
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -153,6 +171,7 @@ class Handler(BaseHTTPRequestHandler):
         consent_obtained = _checked(form, "consent_obtained")
         consent_timestamp_raw = _first(form, "consent_timestamp")
         now_utc_raw = _first(form, "now_utc")
+        solicitations_raw = _first(form, "solicitations_in_last_24h")
 
         try:
             consent_timestamp = (
@@ -161,8 +180,9 @@ class Handler(BaseHTTPRequestHandler):
                 else (datetime.now(timezone.utc) if consent_obtained else None)
             )
             now_utc = parse_utc_timestamp(now_utc_raw) if now_utc_raw else None
-        except argparse.ArgumentTypeError as exc:
-            self._send_html(400, PAGE_TEMPLATE.format(body=f"<p>Invalid timestamp: {_escape(exc)}</p>"))
+            solicitations_in_last_24h = int(solicitations_raw) if solicitations_raw else None
+        except (argparse.ArgumentTypeError, ValueError) as exc:
+            self._send_html(400, PAGE_TEMPLATE.format(body=f"<p>Invalid input: {_escape(exc)}</p>"))
             return
 
         context = PreCallContext(
@@ -174,6 +194,7 @@ class Handler(BaseHTTPRequestHandler):
             gdpr_basis_documented=_checked(form, "gdpr_basis_documented"),
             recipient_timezone=_first(form, "recipient_timezone") or None,
             now_utc=now_utc,
+            solicitations_in_last_24h=solicitations_in_last_24h,
         )
         decision = run_precall_checks(context)
         locale, region = resolve_locale_and_region(decision.jurisdiction_chain)
@@ -195,8 +216,11 @@ class Handler(BaseHTTPRequestHandler):
         sections = [
             f"<p>Mode: {_escape(mode.upper())}</p>",
             render_compliance_section(decision),
-            f"<h2>Request body</h2><pre>{_escape(json.dumps(body_preview, indent=2))}</pre>",
         ]
+        retention_section = render_consent_retention_section(context)
+        if retention_section is not None:
+            sections.append(retention_section)
+        sections.append(f"<h2>Request body</h2><pre>{_escape(json.dumps(body_preview, indent=2))}</pre>")
 
         if mode != "execute":
             sections.append("<p>Dry-run: nothing was sent.</p>")

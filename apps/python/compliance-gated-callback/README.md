@@ -30,17 +30,31 @@ calling tool checks any of this automatically before dialing.
 | Jurisdiction | Key rules |
 |---|---|
 | US federal | 8am-9pm local recipient time, documented prior express written consent, National DNC Registry scrub, FCC-required artificial-voice disclosure, revocation honored by any means |
+| Oregon (stacks on US federal) | Narrower 8am-8pm local recipient time, solicitation cap of 3 calls+texts combined per rolling 24h (HB 3865), revocation honored |
 | EU common (27 member states) | AI Act Art. 50 disclosure of the AI interaction, ePrivacy Art. 13(1) opt-in consent, GDPR Art. 6 lawful basis documented |
 | France (stacks on EU common) | Opt-in consent required since 2026-08-11, calls only Mon-Fri 10h-13h and 14h-20h, Bloctel/opposition-list scrub |
 
-State-level US variation is not implemented yet; every US number is
-currently evaluated against the federal baseline only. Also note: `+1`
-is the shared NANP calling code for the United States, Canada, and over
-twenty Caribbean territories, not the United States alone. This app has
-no area-code lookup table yet, so every `+1` number is routed to the US
-federal jurisdiction today; a Canadian or Caribbean number would
+Oregon is this app's first US state-level variation, stacked on top of
+`us_federal` the same way `fr` stacks on `eu_common` - proof the
+per-jurisdiction architecture extends below country level, not just
+across countries. It is matched by area code (`503`, `541`, `971`,
+`458` - `compliance/dispatcher.py`'s `_US_STATE_AREA_CODE_OVERLAY`)
+since the shared `+1` country code cannot identify a state on its own.
+The solicitation cap has no call-history database to check against, so
+`--solicitations-in-last-24h` is an operator-attested count from their
+own records; omitting it fails closed, same as an unsupplied
+`--recipient-timezone`. Adding a second state means adding its area
+codes to that overlay, not changing the resolution logic. Every other
+US number still falls through to the federal baseline alone.
+
+Also note: `+1` is the shared NANP calling code for the United States,
+Canada, and over twenty Caribbean territories, not the United States
+alone. This app has no full area-code-to-country lookup table, so every
+`+1` number not matched by the Oregon overlay above is routed to the US
+federal jurisdiction alone; a Canadian or Caribbean number would
 currently be evaluated against the wrong rules. `+33` (France) has no
-such ambiguity.
+such ambiguity: EU country calling codes are one-to-one with a single
+country.
 
 ## Legal disclaimer and known gray areas
 
@@ -70,6 +84,16 @@ gray areas came out of that research and are not settled law:
 6. New US state "mini-TCPA" laws keep appearing (Florida, Maryland, New
    Jersey, Oklahoma and others); the jurisdiction table above is a
    snapshot, not a permanently accurate one.
+7. California's AB 316 (Cal. Civil Code Sec. 1714.46, effective
+   2026-01-01) bars "the AI made the decision" as a defense to certain
+   civil claims arising from an AI system's actions - a business cannot
+   point at the calling agent to avoid liability for what it did or
+   said. This is settled law, not an open question, but this app has no
+   California-specific jurisdiction module yet: California numbers
+   currently fall through to the US federal baseline only, same as any
+   other state without an overlay (see the Oregon note above for how
+   that gap gets closed). Given AB 316's liability shift, this is a real
+   coverage gap for California calls, not just a documentation footnote.
 
 Two of these are implemented in code today as explicit, short-lived
 exceptions rather than silently assumed: a US call outside the calling
@@ -80,6 +104,40 @@ holidays are not yet excluded from the calling window, only weekends
 `confidence=MEDIUM` on the specific `CheckResult` they produce - that
 marker means "this is a product decision pending legal confirmation,"
 not "this is sourced law."
+
+**TCPA jurisdiction clarification (2026-08-29 research pass, no code
+change needed):** the TCPA and its state-level "mini-TCPA" equivalents
+apply based on the recipient's own location, not on how the call is
+routed or which infrastructure it passes through. This app already
+matches that: `resolve_jurisdiction_chain` resolves purely from
+`context.phone_e164`, the recipient's own E.164 number, never from any
+routing or carrier-path detail. This is confirmation that the existing
+design was already correct, not a fix.
+
+## Consent record retention
+
+Every dry-run and execute that includes `--consent-timestamp` also
+prints a `consent_retention_expires_at` line: how long the operator
+should keep that consent record. It is computed as
+`max(consent_timestamp, now) + 5 years`
+(`compute_consent_retention_expiry` in `compliance/models.py`),
+calendar-accurate (including leap-day anchors), and re-anchored forward
+on every call placed on the strength of that same consent.
+
+This single 5-year rule is deliberately the more conservative reading
+of two different regimes at once: the US FTC's Telemarketing Sales Rule
+requires keeping consent records for 5 years from when consent was
+given (16 CFR 310.5(a)(8)), a flat deadline that does not reset;
+Germany's UWG Sec. 7a also requires 5 years, but resets on every use of
+that consent. Resetting on every call satisfies both simultaneously
+without this app having to know which regime actually governs a given
+call.
+
+This value is informational only: it is never sent to CALL-E and never
+gates whether a call is allowed - there is nothing to block pre-call
+about a retention deadline that lies in the future. It only appears
+when `--consent-timestamp` was supplied; a run without one prints no
+retention line.
 
 ## Setup
 
@@ -107,6 +165,25 @@ uv run python client.py \
   --consent-obtained --consent-timestamp 2026-08-20T12:00:00Z \
   --dnc-checked \
   --recipient-timezone America/New_York
+```
+
+Because `--consent-timestamp` is set, this also prints a
+`consent_retention_expires_at`-derived line telling the operator how
+long to keep that consent record (see Consent record retention above).
+
+Dry-run for an Oregon number (area code `503`), fully compliant. Note
+the extra `--solicitations-in-last-24h` flag, required for any Oregon
+number, and the `us_federal -> us_oregon` jurisdiction chain in the
+printed decision:
+
+```bash
+uv run python client.py \
+  --task "Call the recipient and find out why they are calling in." \
+  --phone +15035550100 \
+  --consent-obtained --consent-timestamp 2026-08-20T12:00:00Z \
+  --dnc-checked \
+  --recipient-timezone America/Los_Angeles \
+  --solicitations-in-last-24h 0
 ```
 
 Dry-run for a France number, fully compliant. Note the extra
@@ -221,16 +298,19 @@ inactivity, so the first request after idle can be slow.
    returns one `CheckResult` per rule.
 2. Register the module in `compliance/dispatcher.py`'s `_MODULES` dict,
    and add its country-code prefix - or append it to an existing chain,
-   for a member-state variation - in `_COUNTRY_CODE_CHAINS`.
+   for a member-state variation - in `_COUNTRY_CODE_CHAINS`. For a US
+   state-level variation instead, add its area codes to
+   `_US_STATE_AREA_CODE_OVERLAY` (see `us_oregon.py` for the pattern).
 3. Add tests in `test_compliance.py`: one fully-compliant context that
    is allowed, and one test per rule that blocks on its own.
 
 This is additive, not a refactor: `compliance/dispatcher.py`'s
 resolution logic and `client.py`'s CLI do not change. In this repo
-today, the three jurisdiction files run from 94 lines (`eu_common.py`,
+today, the four jurisdiction files run from 94 lines (`eu_common.py`,
 the simplest, with no calling-window logic) to 154 lines
 (`us_federal.py`, the most involved one, with the recent-consent gray
-area included).
+area included); `us_oregon.py` (124 lines) is the first one stacked on
+another US jurisdiction rather than a country code.
 
 ## Safety
 

@@ -64,6 +64,16 @@ FR_COMPLIANT_FLAGS = [
     "--now-utc", "2026-08-25T09:00:00Z",
 ]
 
+OREGON_PHONE = "+15035550100"  # NANP reserved block NPA-555-01XX, Oregon area code 503
+OREGON_COMPLIANT_FLAGS = [
+    "--consent-obtained",
+    "--consent-timestamp", "2026-08-20T12:00:00Z",
+    "--dnc-checked",
+    "--recipient-timezone", "America/Los_Angeles",
+    "--now-utc", "2026-08-25T19:00:00Z",  # 12:00 local Portland, Tuesday, within 8-20
+    "--solicitations-in-last-24h", "0",
+]
+
 
 def test_live_base_url_is_blocked_without_allow_live() -> None:
     with pytest.raises(LiveCallBlockedError):
@@ -376,3 +386,44 @@ def test_cli_execute_result_includes_manipulation_flag() -> None:
 
         assert result.returncode == 0, result.stderr
         assert '"manipulation_attempt_detected": false' in result.stdout
+
+
+def test_cli_dry_run_oregon_compliant_shows_state_variation() -> None:
+    """First US state-level variation: an Oregon area code stacks
+    us_oregon on top of us_federal, proving the extensible architecture.
+    """
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, OREGON_PHONE, OREGON_COMPLIANT_FLAGS)
+
+        assert result.returncode == 0, result.stderr
+        assert "Compliance gate: jurisdiction_chain=us_federal -> us_oregon" in result.stdout
+        assert "Compliance gate: allowed=True" in result.stdout
+        assert '"region": "US"' in result.stdout
+        assert server.creates == 0
+
+
+def test_cli_dry_run_oregon_missing_solicitation_count_blocks() -> None:
+    flags_without_solicitations = OREGON_COMPLIANT_FLAGS[:-2]
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, OREGON_PHONE, flags_without_solicitations)
+
+        assert result.returncode == 0, result.stderr
+        assert "Compliance gate: allowed=False" in result.stdout
+        assert "not attested" in result.stdout
+
+
+def test_cli_dry_run_shows_consent_retention() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, US_PHONE, US_COMPLIANT_FLAGS)
+
+        assert result.returncode == 0, result.stderr
+        assert "Consent record retention: keep this consent record until 2031-08-25" in result.stdout
+        assert "FTC TSR 16 CFR 310.5" in result.stdout
+
+
+def test_cli_dry_run_no_retention_line_without_consent_timestamp() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, [])
+
+        assert result.returncode == 0, result.stderr
+        assert "Consent record retention" not in result.stdout

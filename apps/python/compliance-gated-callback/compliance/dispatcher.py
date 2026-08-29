@@ -6,31 +6,44 @@ default-allow path anywhere in this module.
 
 from __future__ import annotations
 
-from .jurisdictions import eu_common, fr, us_federal
+from .jurisdictions import eu_common, fr, us_federal, us_oregon
 from .models import CheckResult, PreCallContext, PreCallDecision
 
 # Country-code prefix -> ordered jurisdiction chain (broad to narrow).
-# State-level US variation is intentionally not wired in yet; adding a
-# state layer later means adding entries here, not changing this module's
-# interface or the dispatch logic below.
 #
 # KNOWN LIMITATION: "+1" is the shared NANP calling code for the United
 # States, Canada, and over twenty Caribbean territories - it does not
-# uniquely identify the United States. Disambiguating them requires an
-# area-code lookup table this app does not have yet, so every "+1" number
-# is currently routed to us_federal. A Canadian or Caribbean NANP number
-# will incorrectly be evaluated against US federal rules until this is
-# addressed. "+33" (France) has no such ambiguity: EU country calling
-# codes are one-to-one with a single country.
+# uniquely identify the United States. Disambiguating all of NANP requires
+# a full area-code-to-country lookup table this app does not have yet, so
+# every "+1" number not matched by _US_STATE_AREA_CODE_OVERLAY below is
+# still routed to us_federal alone. A Canadian or Caribbean NANP number
+# will incorrectly be evaluated against US federal rules until that
+# broader table exists. "+33" (France) has no such ambiguity: EU country
+# calling codes are one-to-one with a single country.
 _COUNTRY_CODE_CHAINS: dict[str, tuple[str, ...]] = {
     "+1": ("us_federal",),
     "+33": ("eu_common", "fr"),
+}
+
+# US state-level overlay, keyed by area code (NPA) since +1 alone cannot
+# distinguish states (see the NANP limitation above). Appended after the
+# base "+1" chain, the same way "fr" stacks after "eu_common". Area codes
+# are unique across all of NANP, so this does not add to the Canada/
+# Caribbean ambiguity - it only ever matches genuinely Oregon numbers.
+# Oregon is the first entry; a second state means adding its area codes
+# here, not changing the resolution logic below.
+_US_STATE_AREA_CODE_OVERLAY: dict[str, str] = {
+    "503": "us_oregon",
+    "541": "us_oregon",
+    "971": "us_oregon",
+    "458": "us_oregon",
 }
 
 _MODULES = {
     "us_federal": us_federal,
     "eu_common": eu_common,
     "fr": fr,
+    "us_oregon": us_oregon,
 }
 
 
@@ -40,8 +53,14 @@ class UnknownJurisdictionError(Exception):
 
 def resolve_jurisdiction_chain(phone_e164: str) -> tuple[str, ...]:
     for prefix, chain in _COUNTRY_CODE_CHAINS.items():
-        if phone_e164.startswith(prefix):
-            return chain
+        if not phone_e164.startswith(prefix):
+            continue
+        if prefix == "+1":
+            area_code = phone_e164[len(prefix) : len(prefix) + 3]
+            state_jurisdiction = _US_STATE_AREA_CODE_OVERLAY.get(area_code)
+            if state_jurisdiction is not None:
+                return chain + (state_jurisdiction,)
+        return chain
     raise UnknownJurisdictionError(
         f"no jurisdiction mapped for {phone_e164!r}; fail-closed, refusing to call"
     )
