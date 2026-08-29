@@ -422,6 +422,22 @@ another US jurisdiction rather than a country code.
   timeout or connection error) is never retried automatically - a blind
   retry could place a second real call. `GET` polling, which is
   non-mutating, keeps retrying safely.
+- Polling `GET /v1/calls/{id}` after a real call is placed continues
+  indefinitely by default, not for a fixed timeout: this app cannot
+  technically tell a call that is taking a long time because the
+  conversation is genuinely long apart from one that is stuck - both
+  look identical from here (status stays `queued`/`in_progress`, no
+  error). Rather than guess and risk cutting a real conversation short,
+  it prints a repeating reminder every 5 minutes
+  (`--poll-warn-after-seconds`) instead of stopping, so the choice to
+  keep waiting or go check the CALL-E dashboard is always the
+  operator's, not this script's. Ctrl+C stops watching at any time (the
+  call itself is not canceled - see the cancel-endpoint limitation
+  above). `--poll-timeout-seconds` is still available for
+  scripted/automated callers that want a guaranteed hard cutoff
+  instead. This does not apply to the web UI, whose `--execute` mode
+  keeps its fixed 120s cap (see Web UI above) since a browser request
+  has no Ctrl+C equivalent.
 - Any unmapped jurisdiction, any missing rule, or any single failing
   check blocks the call; there is no default-allow path anywhere in
   `compliance/dispatcher.py`.

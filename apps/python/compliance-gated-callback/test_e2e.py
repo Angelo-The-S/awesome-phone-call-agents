@@ -24,9 +24,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import client as client_module
 from client import (
     BUSINESS_CONTEXT_HEADER,
     MAX_BUSINESS_CONTEXT_CHARS,
@@ -112,6 +114,103 @@ def test_create_and_poll_reaches_completed_with_intent_result() -> None:
         assert final_call["recipients"][0]["locale"] == "fr-FR"
         assert final_call["recipients"][0]["region"] == "FR"
         assert server.creates == 1
+
+
+class _FakeClock:
+    """Lets poll_until_terminal tests simulate minutes of elapsed time
+    instantly instead of actually sleeping - fake_server.py's CallRecord
+    status is driven by read count, not wall-clock time, so it can't
+    simulate a long-running call on its own; these tests monkeypatch
+    client.time.monotonic/client.time.sleep and stub get_call directly.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _stub_get_call(statuses: list[str]) -> Any:
+    calls = {"count": 0}
+
+    def get_call(self, call_id: str) -> dict[str, Any]:
+        index = min(calls["count"], len(statuses) - 1)
+        calls["count"] += 1
+        return {"id": call_id, "status": statuses[index]}
+
+    return get_call
+
+
+def test_poll_until_terminal_polls_indefinitely_by_default(monkeypatch) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(client_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(client_module.time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        CallEClient, "get_call", _stub_get_call(["in_progress"] * 20 + ["completed"])
+    )
+
+    api_client = CallEClient(base_url="http://fake", api_key=TEST_API_KEY)
+    final_call = api_client.poll_until_terminal("call_123", interval_seconds=60.0)
+
+    assert final_call["status"] == "completed"
+
+
+def test_poll_until_terminal_warns_repeatedly_at_expected_intervals(monkeypatch) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(client_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(client_module.time, "sleep", clock.sleep)
+    # 16 non-terminal reads then completed: crosses the 300s/600s/900s warn
+    # thresholds (at reads 6, 11, 16) and reaches "completed" on read 17,
+    # just before a 4th warning (1200s) would otherwise fire.
+    monkeypatch.setattr(
+        CallEClient, "get_call", _stub_get_call(["in_progress"] * 16 + ["completed"])
+    )
+
+    warnings: list[float] = []
+    api_client = CallEClient(base_url="http://fake", api_key=TEST_API_KEY)
+    api_client.poll_until_terminal(
+        "call_123",
+        interval_seconds=60.0,
+        warn_after_seconds=300.0,
+        on_warn=lambda minutes, call: warnings.append(minutes),
+    )
+
+    assert warnings == [5.0, 10.0, 15.0]
+
+
+def test_poll_until_terminal_no_warnings_when_disabled(monkeypatch) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(client_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(client_module.time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        CallEClient, "get_call", _stub_get_call(["in_progress"] * 30 + ["completed"])
+    )
+
+    warnings: list[float] = []
+    api_client = CallEClient(base_url="http://fake", api_key=TEST_API_KEY)
+    api_client.poll_until_terminal(
+        "call_123",
+        interval_seconds=60.0,
+        warn_after_seconds=None,
+        on_warn=lambda minutes, call: warnings.append(minutes),
+    )
+
+    assert warnings == []
+
+
+def test_poll_until_terminal_explicit_timeout_still_raises(monkeypatch) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(client_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(client_module.time, "sleep", clock.sleep)
+    monkeypatch.setattr(CallEClient, "get_call", _stub_get_call(["in_progress"]))
+
+    api_client = CallEClient(base_url="http://fake", api_key=TEST_API_KEY)
+    with pytest.raises(TimeoutError):
+        api_client.poll_until_terminal("call_123", interval_seconds=10.0, timeout_seconds=30.0)
 
 
 def test_insufficient_balance_error_is_surfaced() -> None:
@@ -206,8 +305,6 @@ def _run_cli(
             phone,
             "--poll-interval-seconds",
             "0.01",
-            "--poll-timeout-seconds",
-            "5",
             *extra_args,
         ],
         capture_output=True,
@@ -456,6 +553,57 @@ def test_cli_execute_result_includes_manipulation_flag() -> None:
 
         assert result.returncode == 0, result.stderr
         assert '"manipulation_attempt_detected": false' in result.stdout
+
+
+def test_cli_execute_explicit_poll_timeout_still_raises() -> None:
+    """--poll-timeout-seconds remains available as an explicit opt-in hard
+    cutoff for automated/scripted usage. 0 is deterministic: the fake
+    server's first read is always non-terminal (fake_server.py needs 2
+    reads to reach "completed"), and any nonzero elapsed time already
+    exceeds a 0s deadline, so this can't flake on a slow machine the way
+    a small-but-nonzero timeout could.
+    """
+    with FakeCalleServer() as server:
+        result = _run_cli(
+            server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--execute", "--poll-timeout-seconds", "0"]
+        )
+
+        assert result.returncode == 1
+        assert "did not reach a terminal status" in result.stderr
+
+
+def test_cli_execute_ctrl_c_during_poll_is_handled_cleanly(monkeypatch, capsys) -> None:
+    """Ctrl+C during indefinite polling should print a clean message and
+    exit 1, not a raw traceback. Simulated in-process by monkeypatching
+    poll_until_terminal to raise KeyboardInterrupt, rather than sending a
+    real OS signal to a subprocess, which is unreliable cross-platform
+    (especially on Windows).
+    """
+    monkeypatch.delenv("CALLE_API_KEY", raising=False)
+
+    def fake_poll(self, *args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(CallEClient, "poll_until_terminal", fake_poll)
+
+    with FakeCalleServer() as server:
+        argv = [
+            "--base-url",
+            server.base_url,
+            "--task",
+            "Call the recipient and find out why they are calling in.",
+            "--phone",
+            FR_PHONE,
+            *FR_COMPLIANT_FLAGS,
+            "--execute",
+        ]
+        exit_code = client_module.main(argv)
+        assert server.creates == 1
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Ctrl+C" in captured.err
+    assert "Stopped watching call" in captured.err
 
 
 def test_cli_dry_run_business_context_appears_before_operator_task() -> None:

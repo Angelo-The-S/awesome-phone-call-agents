@@ -563,21 +563,50 @@ class CallEClient:
         self,
         call_id: str,
         interval_seconds: float = 2.0,
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float | None = None,
+        warn_after_seconds: float | None = 300.0,
         on_poll: Any = None,
+        on_warn: Any = None,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout_seconds
+        """Poll GET /v1/calls/{call_id} until a terminal status.
+
+        Polls indefinitely by default (timeout_seconds=None): this app
+        cannot distinguish a call that is taking a long time because the
+        conversation is genuinely long from one that is stuck - both look
+        identical here (status stays queued/in_progress, no error). Rather
+        than guess and risk cutting a real conversation short, this reports
+        a periodic warning (every warn_after_seconds, via on_warn) instead
+        of raising, so the operator decides whether to keep waiting or go
+        check the CALL-E dashboard. Ctrl+C always remains available.
+        timeout_seconds is still available for automated/testable callers
+        that want a guaranteed hard cutoff (raises TimeoutError, unchanged
+        behavior from before this change).
+
+        This is unrelated to network/HTTP error handling: those are already
+        covered by _request()'s own retry logic and still raise immediately
+        regardless of these settings.
+        """
+        started = time.monotonic()
+        deadline = started + timeout_seconds if timeout_seconds is not None else None
+        next_warn_at = started + warn_after_seconds if warn_after_seconds is not None else None
+        warn_count = 0
         while True:
             call = self.get_call(call_id)
             if on_poll is not None:
                 on_poll(call)
             if call.get("status") in TERMINAL_STATUSES:
                 return call
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
                 raise TimeoutError(
                     f"call {call_id} did not reach a terminal status within {timeout_seconds}s "
                     f"(last status: {call.get('status')!r})"
                 )
+            if next_warn_at is not None and now >= next_warn_at:
+                warn_count += 1
+                if on_warn is not None:
+                    on_warn(warn_count * (warn_after_seconds / 60.0), call)
+                next_warn_at = started + (warn_count + 1) * warn_after_seconds
             time.sleep(interval_seconds)
 
 
@@ -625,7 +654,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task", required=True)
     parser.add_argument("--phone", required=True, help="E.164 phone number for the single recipient.")
     parser.add_argument("--poll-interval-seconds", type=float, default=2.0)
-    parser.add_argument("--poll-timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
+        "--poll-timeout-seconds",
+        type=float,
+        default=None,
+        help="Optional hard cutoff for polling GET /v1/calls/{id}, in seconds. Default: none - "
+        "polling continues indefinitely until a terminal status, since a long call cannot be "
+        "distinguished from a stuck one. Mainly for automated/scripted usage that wants a "
+        "guaranteed return. Ctrl+C always stops polling manually.",
+    )
+    parser.add_argument(
+        "--poll-warn-after-seconds",
+        type=float,
+        default=300.0,
+        help="How often (seconds) to print a reminder that the call is still in progress. "
+        "Default: 300 (5 minutes), repeating for as long as polling continues.",
+    )
     parser.add_argument(
         "--execute",
         action="store_true",
@@ -794,13 +838,31 @@ def main(argv: list[str] | None = None) -> int:
     def report(call: dict[str, Any]) -> None:
         print(f"Poll: status={call.get('status')}")
 
+    def report_warning(minutes_elapsed: float, call: dict[str, Any]) -> None:
+        print(
+            f"This call has been in progress for over {minutes_elapsed:.0f} minutes. This can be "
+            "normal for a long conversation, or may indicate an issue. Check the CALL-E dashboard "
+            f"if concerned. Still watching... (last status: {call.get('status')!r})",
+            flush=True,
+        )
+
     try:
         final_call = client.poll_until_terminal(
             call_id,
             interval_seconds=args.poll_interval_seconds,
             timeout_seconds=args.poll_timeout_seconds,
+            warn_after_seconds=args.poll_warn_after_seconds,
             on_poll=report,
+            on_warn=report_warning,
         )
+    except KeyboardInterrupt:
+        print(
+            f"\nStopped watching call {call_id} (Ctrl+C). The call itself was not canceled - "
+            "calle.openapi.yaml has no cancel endpoint (known limitation, C31) - check the "
+            f"CALL-E dashboard or GET /v1/calls/{call_id} for its current status.",
+            file=sys.stderr,
+        )
+        return 1
     except (CallEAPIError, TimeoutError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
