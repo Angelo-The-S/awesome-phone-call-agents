@@ -54,6 +54,36 @@ from typing import Any
 from compliance.dispatcher import resolve_locale_and_region, run_precall_checks
 from compliance.models import PreCallContext, PreCallDecision, compute_consent_retention_expiry
 
+def load_dotenv(env_path: Path | None = None) -> None:
+    """Minimal .env loader (stdlib only, no python-dotenv dependency).
+
+    Reads KEY=VALUE lines from env_path (defaults to a .env file in this
+    script's own directory - never the current working directory) and
+    sets them in os.environ only if the key is not already set: a real
+    system environment variable always wins over .env. A missing file is
+    not an error - this is a local-dev convenience, not a requirement.
+    The optional env_path parameter exists so tests can point this at a
+    throwaway file instead of ever touching a developer's real .env.
+    """
+    if env_path is None:
+        env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, sep, value = stripped.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv()
+
 REAL_API_BASE_URL = "https://api.heycall-e.com"
 DEFAULT_BASE_URL = os.environ.get("CALLE_API_BASE_URL", REAL_API_BASE_URL)
 API_KEY_ENV_VAR = "CALLE_API_KEY"

@@ -40,6 +40,7 @@ from client import (
     build_recipient,
     default_intent_result_schema,
     derive_idempotency_key,
+    load_dotenv,
     mask_secret,
     parse_utc_timestamp,
     redacted_call_for_display,
@@ -49,6 +50,8 @@ from client import (
 )
 from compliance.dispatcher import resolve_locale_and_region, run_precall_checks
 from compliance.models import PreCallContext, compute_consent_retention_expiry
+
+load_dotenv()
 
 FORM_PAGE = """<!doctype html>
 <html lang="en">

@@ -150,6 +150,20 @@ database bundled on Windows; `uv sync` installs the `tzdata` package
 automatically there via a platform marker in `pyproject.toml`. Nothing
 extra to do on Linux or macOS, which already ship system tzdata.
 
+Copy `.env.example` to `.env` and fill in your real `CALLE_API_KEY` to
+avoid exporting it in every terminal session:
+
+```bash
+cp .env.example .env
+# then edit .env and set CALLE_API_KEY=your_real_key
+```
+
+`.env` is only ever read from this app's own directory, never
+committed (already covered by the repo's root `.gitignore`: `.env`,
+`.env.*`, with `.env.example` explicitly excepted), and a real
+`CALLE_API_KEY` already set in your shell environment always takes
+priority over whatever is in `.env`.
+
 ## Usage
 
 Windows/PowerShell users: replace `export VAR=value` below with
