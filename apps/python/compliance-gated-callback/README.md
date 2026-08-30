@@ -273,10 +273,20 @@ blocks, in this fixed order, never merged into one paragraph:
 ```
 
 `build_hardened_task(operator_task, business_context)` in `client.py`
-builds this. The business context block is explicitly labeled as
-reference material, not instructions - the same "additive, never a
-rewrite" principle already used for the injection-resistance block (see
-Prompt injection resistance below).
+builds this. The business context block is still additive, never a
+rewrite of anything else in the task - the same principle already used
+for the injection-resistance block (see Prompt injection resistance
+below) - but its own wording (`BUSINESS_CONTEXT_HEADER`) directly
+instructs the model to answer from these facts, not just keep them as
+passive background.
+
+That wording was hardened after a real test call: the business context
+contained the exact answer to a question the caller asked, but the
+model said it did not have that information and offered a human
+callback instead of using what was right there in front of it. The
+header now explicitly tells the model to answer directly from the
+facts listed, and not to fall back to "I don't have that" or a
+callback offer when the answer is present in the business context.
 
 Rules:
 - Providing business context is optional and never a compliance

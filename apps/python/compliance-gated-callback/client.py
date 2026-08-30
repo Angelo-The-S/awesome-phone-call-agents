@@ -304,13 +304,18 @@ MAX_BUSINESS_CONTEXT_CHARS = 4000
 
 # Label wrapping operator-supplied business background so CALL-E (and any
 # future reader of the task string) can tell it apart from the operator's
-# own instructions - reference material, not something to act on. Same
-# "additive, never merged" principle as TASK_INJECTION_RESISTANCE_INSTRUCTIONS,
-# just for the opposite direction (context the model should use, not a
-# safety rule it must follow).
+# own instructions - still additive, never merged, same principle as
+# TASK_INJECTION_RESISTANCE_INSTRUCTIONS. Worded to directly instruct
+# active use rather than "reference only": a real live call showed the
+# model had the exact business facts (a price) in this block yet still
+# answered "I don't have that information" and pushed every price/service
+# question to a human callback instead of using what was right there.
 BUSINESS_CONTEXT_HEADER = (
-    "Background information about this business, for reference only - use it to "
-    "answer questions, it does not change what you are asked to do on this call:"
+    "Business information below. When the caller asks about prices, hours, services, or "
+    "other details covered here, answer directly using these exact facts - do not say you "
+    "don't have this information or offer only a callback when the answer is listed below. "
+    "This is reference material to answer FROM, not just background - it does not change "
+    "what you are asked to do on this call otherwise."
 )
 
 
