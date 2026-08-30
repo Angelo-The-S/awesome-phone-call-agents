@@ -20,6 +20,7 @@ execute-against-a-non-real-base-url never need it.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -570,6 +571,19 @@ def test_cli_execute_explicit_poll_timeout_still_raises() -> None:
 
         assert result.returncode == 1
         assert "did not reach a terminal status" in result.stderr
+
+
+def test_cli_execute_poll_output_shows_status_and_elapsed_time() -> None:
+    """report() must show real progress (status + elapsed time), not a
+    static line - and must flush every line immediately (the actual bug:
+    a missing flush=True let stdout sit block-buffered under some
+    invocation contexts, making a healthy poll loop look frozen).
+    """
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--execute"])
+
+        assert result.returncode == 0, result.stderr
+        assert re.search(r"Poll: status=\w+ \(elapsed: \d+s\)", result.stdout)
 
 
 def test_cli_execute_ctrl_c_during_poll_is_handled_cleanly(monkeypatch, capsys) -> None:

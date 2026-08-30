@@ -840,8 +840,18 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
+    poll_started_at = time.monotonic()
+
     def report(call: dict[str, Any]) -> None:
-        print(f"Poll: status={call.get('status')}")
+        # flush=True matters here specifically: this prints on every poll
+        # tick during a potentially long wait with nothing else happening
+        # in between (just time.sleep()). Without it, stdout can sit
+        # block-buffered under some invocation contexts (seen with `uv
+        # run` on Windows) and never actually reach the terminal until
+        # the process exits - making a perfectly healthy poll loop look
+        # frozen on its last-flushed status.
+        elapsed_seconds = time.monotonic() - poll_started_at
+        print(f"Poll: status={call.get('status')} (elapsed: {elapsed_seconds:.0f}s)", flush=True)
 
     def report_warning(minutes_elapsed: float, call: dict[str, Any]) -> None:
         print(
