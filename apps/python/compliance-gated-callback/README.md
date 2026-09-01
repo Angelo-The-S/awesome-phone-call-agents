@@ -56,6 +56,54 @@ currently be evaluated against the wrong rules. `+33` (France) has no
 such ambiguity: EU country calling codes are one-to-one with a single
 country.
 
+## AI disclosure
+
+**This was a real defect found by testing, not a cosmetic addition.**
+Every jurisdiction module defines a `DISCLOSURE_SCRIPT` constant (AI Act
+Art. 50 / FCC rule 24-17 wording), and the compliance gate printed
+`[PASS] ..._ai_disclosure: disclosure_script discloses the AI
+interaction`. But that check only ever inspected the constant against
+*itself* - a tautology, since the constant is our own hardcoded text and
+the check just looks for the word "artificial" inside it. Nothing in
+`client.py` or `web_server.py` ever read `RULES.disclosure_script` or
+passed it into the task sent to CALL-E. A call could pass the
+compliance gate's AI-disclosure check while the real call disclosed
+nothing at all, unless the operator happened to write a disclosure into
+their own `--task` by hand.
+
+The fix: `compliance.dispatcher.resolve_locale_and_region` now also
+resolves the effective `disclosure_script` for the jurisdiction chain
+(same "narrowest jurisdiction that actually defines one wins" rule
+already used for `region_code` - a state-level entry like `us_oregon`
+with no script of its own inherits `us_federal`'s). `build_hardened_task`
+sends it as a real, separately delimited block - and puts it **first**,
+before business context or the operator's own task, because disclosure
+has to happen at the very start of the call, not after other content.
+
+The scripts contain placeholders (`[ENTITY]`/`[ENTITE]`, `[CALLER_NAME]`,
+`[CALLBACK_NUMBER]`) that must never reach CALL-E as literal bracket
+text - a voice agent would say the brackets out loud. `--entity-name`
+(CLI and web form) lets an operator supply their real business name to
+fill `[ENTITY]`/`[ENTITE]`; omitting it uses an honest, generic fallback
+(`"this organization"` / `"cette organisation"`) rather than a
+fabricated business name. `[CALLER_NAME]` always becomes `"an automated
+calling system"` - this app has no bot-persona-name concept, and the
+next sentence in every script already states the AI disclosure
+explicitly. `[CALLBACK_NUMBER]` always becomes `"the number that just
+called you"` - this app has no distinct callback-number concept
+(CALL-E's outbound caller ID is not guaranteed to accept inbound calls),
+so inventing a specific number would be actively misleading; this
+phrasing identifies the number without asserting it is reachable.
+
+```bash
+uv run python client.py \
+  --task "Answer the recipient's questions about our practice." \
+  --phone +33639980456 \
+  --consent-obtained --dnc-checked --gdpr-basis-documented \
+  --recipient-timezone Europe/Paris \
+  --entity-name "Bright Smile Dental"
+```
+
 ## Legal disclaimer and known gray areas
 
 This app is not legal advice, and passing its compliance gate is not a
@@ -531,9 +579,14 @@ another US jurisdiction rather than a country code.
 - `client.py` and `fake_server.py` depend on nothing but the Python
   standard library plus `tzdata`; there is no unpublished or private
   package dependency to audit.
-- Locale and region sent to CALL-E always come from the jurisdiction
-  that was actually checked (`resolve_locale_and_region`), so what is
-  sent can never drift from what was verified.
+- Locale, region, and the AI-disclosure script sent to CALL-E always
+  come from the jurisdiction that was actually checked
+  (`resolve_locale_and_region`), so what is sent can never drift from
+  what was verified.
+- The jurisdiction's AI-disclosure script (`RULES.disclosure_script`)
+  is a real, separately delimited block in the task now, sent first -
+  see AI disclosure above for why this was a real defect, not a
+  cosmetic addition.
 
 ## Prompt injection resistance
 
@@ -606,7 +659,13 @@ PreCallDecision (allowed or blocked, with reasons)
   +--> allowed:
          |
          v
-       resolve_locale_and_region(jurisdiction_chain) -> locale, region
+       resolve_locale_and_region(jurisdiction_chain)
+         -> locale, region, disclosure_script
+         |
+         v
+       build_hardened_task(task, business_context, disclosure_script)
+         -> disclosure block FIRST, then business context, operator
+            task, injection-resistance block, voicemail-handling block
          |
          v
        POST /v1/calls (task, recipient with resolved locale/region,

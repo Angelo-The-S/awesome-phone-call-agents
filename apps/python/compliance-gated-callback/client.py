@@ -365,14 +365,55 @@ def validate_business_context(text: str | None) -> str | None:
     return stripped
 
 
-def build_hardened_task(operator_task: str, business_context: str | None = None) -> str:
-    """Assemble the final CALL-E task from up to four distinct, delimited
-    blocks, in this fixed order: business context (if any), the
-    operator's own task text unchanged, the injection-resistance block,
-    then the voicemail-handling block. Never edits or reorders the
+# Label wrapping the jurisdiction's disclosure_script (see
+# compliance/jurisdictions/*.py) so CALL-E knows this text is meant to be
+# spoken, not background instructions. Previously disclosure_script was
+# only ever checked against itself inside each jurisdiction module - a
+# tautology - and was never actually sent to CALL-E, so a call could pass
+# the compliance gate's AI-disclosure check while the real call never
+# disclosed anything. This block, prepended first in build_hardened_task,
+# is the fix.
+DISCLOSURE_INSTRUCTION_HEADER = (
+    "Required disclosure - say this, in substance, near the start of the call, before any "
+    "other content below:"
+)
+
+
+def render_disclosure_script(script: str, entity_name: str | None) -> str:
+    """Fill a jurisdiction's disclosure_script placeholders with the
+    operator-supplied business name, or an honest generic fallback when
+    none is given. [CALLBACK_NUMBER] has no equivalent concept in this
+    app (CALL-E's outbound number is not guaranteed to accept inbound
+    calls) - inventing one would be actively misleading, so it is
+    replaced with a phrase that identifies the number without asserting
+    it is reachable.
+    """
+    entity = entity_name or "this organization"
+    entity_fr = entity_name or "cette organisation"
+    return (
+        script.replace("[ENTITY]", entity)
+        .replace("[ENTITE]", entity_fr)
+        .replace("[CALLER_NAME]", "an automated calling system")
+        .replace("[CALLBACK_NUMBER]", "the number that just called you")
+    )
+
+
+def build_hardened_task(
+    operator_task: str,
+    business_context: str | None = None,
+    disclosure_script: str | None = None,
+) -> str:
+    """Assemble the final CALL-E task from up to five distinct, delimited
+    blocks, in this fixed order: the jurisdiction's AI-disclosure script
+    (if any) FIRST - disclosure must happen at the very start of the
+    call, not buried after other content - then business context (if
+    any), the operator's own task text unchanged, the injection-resistance
+    block, then the voicemail-handling block. Never edits or reorders the
     operator's wording; only adds separately delimited layers around it.
     """
     blocks: list[str] = []
+    if disclosure_script:
+        blocks.append(f"{DISCLOSURE_INSTRUCTION_HEADER}\n{disclosure_script}")
     if business_context:
         blocks.append(f"{BUSINESS_CONTEXT_HEADER}\n{business_context}")
     blocks.append(operator_task)
@@ -815,6 +856,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to a UTF-8 text file with the same business background text. See "
         "business_context_example.txt. Mutually exclusive with --business-context.",
     )
+    parser.add_argument(
+        "--entity-name",
+        default=None,
+        help="Real business/entity name to fill into the jurisdiction's required AI-disclosure "
+        "script (e.g. 'Bright Smile Dental'). Omit to use a generic, honest fallback phrase "
+        "instead of a fabricated name.",
+    )
     return parser.parse_args(argv)
 
 
@@ -836,7 +884,12 @@ def main(argv: list[str] | None = None) -> int:
         solicitations_in_last_24h=args.solicitations_in_last_24h,
     )
     decision = run_precall_checks(context)
-    locale, region = resolve_locale_and_region(decision.jurisdiction_chain)
+    locale, region, disclosure_script_template = resolve_locale_and_region(decision.jurisdiction_chain)
+    disclosure_script = (
+        render_disclosure_script(disclosure_script_template, args.entity_name)
+        if disclosure_script_template
+        else None
+    )
 
     business_context_raw = args.business_context
     if args.business_context_file:
@@ -856,7 +909,7 @@ def main(argv: list[str] | None = None) -> int:
     # args.task (the operator's own wording, untouched) is still what
     # derive_idempotency_key hashes, so the key stays tied to operator
     # intent regardless of edits to the safety block itself.
-    hardened_task = build_hardened_task(args.task, business_context)
+    hardened_task = build_hardened_task(args.task, business_context, disclosure_script)
 
     recipient = build_recipient(args.phone, locale, region)
     body_preview = {

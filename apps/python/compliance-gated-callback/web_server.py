@@ -45,6 +45,7 @@ from client import (
     parse_utc_timestamp,
     redacted_call_for_display,
     redacted_recipient_for_display,
+    render_disclosure_script,
     resolve_api_key,
     validate_business_context,
 )
@@ -64,6 +65,9 @@ FORM_PAGE = """<!doctype html>
   <p><label>Call objective<br><textarea name="task" rows="3" cols="60" required></textarea></label></p>
   <p><label>Business context (optional, pasted directly - services, pricing, hours, FAQs)<br>
      <textarea name="business_context" rows="4" cols="60"></textarea></label></p>
+  <p><label>Entity name for the required AI-disclosure script (optional - a generic, honest
+     fallback phrase is used if left blank)<br>
+     <input type="text" name="entity_name" placeholder="Bright Smile Dental"></label></p>
   <p><label><input type="checkbox" name="consent_obtained" value="1"> Consent obtained</label><br>
      <label>Consent timestamp (ISO 8601 UTC, optional - defaults to now)<br>
        <input type="text" name="consent_timestamp" placeholder="2026-08-20T12:00:00Z"></label></p>
@@ -179,6 +183,7 @@ class Handler(BaseHTTPRequestHandler):
         now_utc_raw = _first(form, "now_utc")
         solicitations_raw = _first(form, "solicitations_in_last_24h")
         business_context_raw = _first(form, "business_context") or None
+        entity_name = _first(form, "entity_name") or None
 
         try:
             consent_timestamp = (
@@ -205,7 +210,12 @@ class Handler(BaseHTTPRequestHandler):
             solicitations_in_last_24h=solicitations_in_last_24h,
         )
         decision = run_precall_checks(context)
-        locale, region = resolve_locale_and_region(decision.jurisdiction_chain)
+        locale, region, disclosure_script_template = resolve_locale_and_region(decision.jurisdiction_chain)
+        disclosure_script = (
+            render_disclosure_script(disclosure_script_template, entity_name)
+            if disclosure_script_template
+            else None
+        )
 
         try:
             recipient = build_recipient(phone, locale, region)
@@ -213,7 +223,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(400, PAGE_TEMPLATE.format(body=f"<p>{_escape(exc)}</p>"))
             return
 
-        hardened_task = build_hardened_task(task, business_context)
+        hardened_task = build_hardened_task(task, business_context, disclosure_script)
         body_preview = {
             "task": hardened_task,
             "recipients": [redacted_recipient_for_display(recipient)],
