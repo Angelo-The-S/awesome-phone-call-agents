@@ -24,6 +24,7 @@ from compliance.dispatcher import (
     resolve_locale_and_region,
     run_precall_checks,
 )
+from compliance.jurisdictions import fr, us_federal
 from compliance.models import ConfidenceLevel, PreCallContext, compute_consent_retention_expiry
 
 # --- US federal fixtures -----------------------------------------------
@@ -93,15 +94,16 @@ def test_france_number_resolves_to_eu_common_then_fr() -> None:
 
 
 def test_resolve_locale_and_region_for_us_federal() -> None:
-    assert resolve_locale_and_region(("us_federal",)) == ("en-US", "US")
+    assert resolve_locale_and_region(("us_federal",)) == ("en-US", "US", us_federal.DISCLOSURE_SCRIPT)
 
 
 def test_resolve_locale_and_region_for_france_stacks_on_eu_common() -> None:
-    assert resolve_locale_and_region(("eu_common", "fr")) == ("fr-FR", "FR")
+    # fr defines its own disclosure_script - most specific wins over eu_common's.
+    assert resolve_locale_and_region(("eu_common", "fr")) == ("fr-FR", "FR", fr.DISCLOSURE_SCRIPT)
 
 
 def test_resolve_locale_and_region_for_empty_chain() -> None:
-    assert resolve_locale_and_region(()) == (None, None)
+    assert resolve_locale_and_region(()) == (None, None, None)
 
 
 def test_unmapped_country_code_raises_and_blocks() -> None:
@@ -263,7 +265,8 @@ def test_non_oregon_us_number_still_resolves_to_us_federal_only() -> None:
 
 
 def test_resolve_locale_and_region_for_oregon() -> None:
-    assert resolve_locale_and_region(("us_federal", "us_oregon")) == ("en-US", "US")
+    # us_oregon.disclosure_script is None - inherits us_federal's.
+    assert resolve_locale_and_region(("us_federal", "us_oregon")) == ("en-US", "US", us_federal.DISCLOSURE_SCRIPT)
 
 
 def test_oregon_fully_compliant_context_is_allowed() -> None:

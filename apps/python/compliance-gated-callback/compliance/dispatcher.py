@@ -66,25 +66,33 @@ def resolve_jurisdiction_chain(phone_e164: str) -> tuple[str, ...]:
     )
 
 
-def resolve_locale_and_region(jurisdiction_chain: tuple[str, ...]) -> tuple[str | None, str | None]:
-    """Locale/region for the CALL-E recipient, derived from a resolved
-    jurisdiction chain - never a caller-supplied override.
+def resolve_locale_and_region(
+    jurisdiction_chain: tuple[str, ...]
+) -> tuple[str | None, str | None, str | None]:
+    """Locale/region/disclosure_script for the CALL-E recipient, derived
+    from a resolved jurisdiction chain - never a caller-supplied override.
 
     Locale comes from the narrowest (last) jurisdiction in the chain.
-    Region comes from the narrowest jurisdiction that actually defines a
-    country-level region_code, scanning from the end of the chain
-    backward (a bloc-wide entry like eu_common has none and is skipped).
+    Region and disclosure_script each come from the narrowest
+    jurisdiction that actually defines one, scanning from the end of the
+    chain backward (a bloc-wide entry like eu_common has no region_code,
+    and a state-level entry like us_oregon has no disclosure_script of
+    its own - both are skipped in favor of the next jurisdiction out).
     """
     if not jurisdiction_chain:
-        return None, None
+        return None, None, None
     locale = _MODULES[jurisdiction_chain[-1]].RULES.default_locale
     region = None
+    disclosure_script = None
     for jurisdiction_id in reversed(jurisdiction_chain):
-        candidate = _MODULES[jurisdiction_id].RULES.region_code
-        if candidate is not None:
-            region = candidate
+        rules = _MODULES[jurisdiction_id].RULES
+        if region is None and rules.region_code is not None:
+            region = rules.region_code
+        if disclosure_script is None and rules.disclosure_script is not None:
+            disclosure_script = rules.disclosure_script
+        if region is not None and disclosure_script is not None:
             break
-    return locale, region
+    return locale, region, disclosure_script
 
 
 def run_precall_checks(context: PreCallContext) -> PreCallDecision:

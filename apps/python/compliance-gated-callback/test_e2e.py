@@ -33,6 +33,7 @@ import pytest
 import client as client_module
 from client import (
     BUSINESS_CONTEXT_HEADER,
+    DISCLOSURE_INSTRUCTION_HEADER,
     MAX_BUSINESS_CONTEXT_CHARS,
     REAL_API_BASE_URL,
     TASK_INJECTION_RESISTANCE_INSTRUCTIONS,
@@ -44,8 +45,11 @@ from client import (
     build_recipient,
     default_intent_result_schema,
     mask_phone,
+    render_disclosure_script,
     validate_business_context,
 )
+from compliance.dispatcher import resolve_jurisdiction_chain, resolve_locale_and_region
+from compliance.jurisdictions import fr, us_federal
 from fake_server import INSUFFICIENT_BALANCE_PHONE, RATE_LIMITED_ONCE_PHONE, FakeCalleServer
 
 HERE = Path(__file__).resolve().parent
@@ -617,6 +621,45 @@ def test_build_hardened_task_includes_voicemail_handling_instructions() -> None:
     assert resistance_index < voicemail_index
 
 
+def test_build_hardened_task_disclosure_script_comes_first() -> None:
+    """AI disclosure must happen at the very start of the call - the
+    disclosure block comes before business context, before the
+    operator's own task, before everything else.
+    """
+    operator_task = "Call the recipient and find out why they are calling in."
+    business_context = "Bright Smile Dental is open Monday-Friday 8am-5pm."
+    disclosure_script = "This call is made by an artificial intelligence system."
+    result = build_hardened_task(operator_task, business_context, disclosure_script)
+
+    disclosure_index = result.index(DISCLOSURE_INSTRUCTION_HEADER)
+    context_index = result.index(business_context)
+    task_index = result.index(operator_task)
+    resistance_index = result.index(TASK_INJECTION_RESISTANCE_INSTRUCTIONS)
+    voicemail_index = result.index(VOICEMAIL_HANDLING_INSTRUCTIONS)
+    assert disclosure_index < context_index < task_index < resistance_index < voicemail_index
+    assert disclosure_script in result
+
+
+def test_render_disclosure_script_fills_all_placeholder_kinds() -> None:
+    result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, "Bright Smile Dental")
+    assert "[CALLER_NAME]" not in result
+    assert "[ENTITY]" not in result
+    assert "[CALLBACK_NUMBER]" not in result
+    assert "Bright Smile Dental" in result
+
+
+def test_render_disclosure_script_generic_fallback_without_entity_name() -> None:
+    result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, None)
+    assert "[ENTITY]" not in result
+    assert "this organization" in result
+
+
+def test_render_disclosure_script_french_fallback() -> None:
+    result = render_disclosure_script(fr.DISCLOSURE_SCRIPT, None)
+    assert "[ENTITE]" not in result
+    assert "cette organisation" in result
+
+
 def test_default_intent_result_schema_answered_by_is_optional() -> None:
     schema = default_intent_result_schema()
     assert "answered_by" in schema["properties"]
@@ -660,7 +703,41 @@ def test_cli_execute_sends_hardened_task_to_api() -> None:
         assert result.returncode == 0, result.stderr
         assert server.creates == 1
         (record,) = server.fake.calls.values()
-        assert record.payload["task"] == build_hardened_task(operator_task)
+        # FR_PHONE resolves to (eu_common, fr); fr defines its own
+        # disclosure_script, and this test's flags pass no --entity-name.
+        chain = resolve_jurisdiction_chain(FR_PHONE)
+        _, _, disclosure_template = resolve_locale_and_region(chain)
+        expected_disclosure = render_disclosure_script(disclosure_template, None)
+        assert record.payload["task"] == build_hardened_task(operator_task, disclosure_script=expected_disclosure)
+
+
+def test_cli_execute_sends_ai_disclosure_to_call_e() -> None:
+    """The AI-disclosure script was previously only checked against
+    itself and never actually sent - this proves it now really is in
+    the payload CALL-E receives, and that it comes before the operator's
+    own task text there too, not just in the unit-level function.
+    """
+    operator_task = "Call the recipient and find out why they are calling in."
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--execute"])
+
+        assert result.returncode == 0, result.stderr
+        (record,) = server.fake.calls.values()
+        task_sent = record.payload["task"]
+        assert "intelligence artificielle" in task_sent
+        assert task_sent.index("intelligence artificielle") < task_sent.index(operator_task)
+
+
+def test_cli_entity_name_fills_disclosure_placeholder() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(
+            server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--entity-name", "Bright Smile Dental"]
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "Bright Smile Dental" in result.stdout
+        assert "[ENTITY]" not in result.stdout
+        assert "[ENTITE]" not in result.stdout
 
 
 def test_cli_execute_result_includes_manipulation_flag() -> None:
