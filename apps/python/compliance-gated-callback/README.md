@@ -166,6 +166,20 @@ priority over whatever is in `.env`.
 
 ## Usage
 
+**If you run this with `--execute` and get blocked**, this is working
+as designed, not a bug: the compliance gate checks the *real* current
+day/time against the recipient jurisdiction's legal calling window (for
+example, weekdays only for France, 8am-9pm local time for the US
+federal baseline). If you are testing outside that window, use
+`--now-utc` to simulate a valid moment instead of waiting for one:
+
+    --now-utc 2026-08-26T14:00:00Z   # a Wednesday, 10am Paris time - inside the FR window
+
+`--now-utc` only overrides the clock the calling-window check reads -
+it has no effect on consent, DNC/opposition-list checks, GDPR basis, or
+any other rule; those still need their own real flags
+(`--consent-obtained`, `--dnc-checked`, etc.) to pass.
+
 Windows/PowerShell users: replace `export VAR=value` below with
 `$env:VAR = "value"`.
 
