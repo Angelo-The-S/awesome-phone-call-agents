@@ -25,9 +25,13 @@ Safety, layered:
   5. Idempotency-Key is always derived from call intent (phone + task +
      invocation time, see derive_idempotency_key), never random or a
      fixed string. A POST that fails with no confirmed HTTP response
-     (timeout, connection error) is never retried automatically - see
-     CallEClient._request - since a blind retry could place a second
-     real call.
+     (timeout, connection error) is never blindly retried - but it does
+     get exactly one safe, automatic retry using the same Idempotency-Key,
+     because CALL-E guarantees that replaying the same key and body
+     returns the original call instead of creating a duplicate (see
+     CallEClient._resolve_ambiguous_post_failure). If that retry also
+     fails ambiguously, this app gives up and says so rather than
+     retrying further or guessing.
 
 Known API limitation: calle.openapi.yaml has no cancel/DELETE endpoint
 for an in-flight call once POST /v1/calls has accepted it (tracked
@@ -490,9 +494,60 @@ class CallEClient:
             headers["Idempotency-Key"] = idempotency_key
         return headers
 
-    def _request(self, method: str, path: str, headers: dict[str, str], body: bytes | None) -> dict[str, Any]:
+    def _resolve_ambiguous_post_failure(
+        self,
+        exc: Exception,
+        url: str,
+        method: str,
+        headers: dict[str, str],
+        idempotent_retry_on_ambiguous_failure: bool,
+        idempotent_retry_used: bool,
+        kind: str,
+    ) -> bool:
+        """For a POST that failed with no confirmed HTTP response. Returns
+        True (the new idempotent_retry_used value) when the caller should
+        retry once more; raises RuntimeError otherwise. Retrying is safe
+        specifically because CALL-E guarantees replaying the same
+        Idempotency-Key and body returns the original call instead of
+        creating a duplicate (calle.openapi.yaml, IdempotencyKey parameter,
+        and explicitly recommended for exactly this case by the sibling
+        GoalRunIdempotencyKey parameter's description) - this is a one-shot
+        verification, not a blind retry.
+        """
+        if idempotent_retry_on_ambiguous_failure and not idempotent_retry_used:
+            print(
+                "   ambiguous failure with an Idempotency-Key set - CALL-E guarantees "
+                "replaying the same key and body returns the original call instead of "
+                "creating a duplicate, so retrying once to resolve this instead of "
+                "leaving it unconfirmed",
+                flush=True,
+            )
+            return True
+        retry_note = (
+            "including one safe automatic retry using the same Idempotency-Key, which also "
+            "did not get a confirmed response"
+            if idempotent_retry_used
+            else "no Idempotency-Key was available to safely retry with"
+        )
+        raise RuntimeError(
+            f"{method} {url} failed with an ambiguous {kind} before any HTTP response was "
+            f"received ({retry_note}). This call may or may not have been created. There is "
+            "no way to list or search calls by Idempotency-Key through this API - check the "
+            f"CALL-E dashboard directly (Idempotency-Key was "
+            f"{headers.get('Idempotency-Key', '<none>')})."
+        ) from exc
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        idempotent_retry_on_ambiguous_failure: bool = False,
+    ) -> dict[str, Any]:
         url = f"{self.base_url.rstrip('/')}{path}"
         last_error: Exception | None = None
+        idempotent_retry_used = False
         for attempt in range(1, MAX_ATTEMPTS + 1):
             request = urllib.request.Request(url, data=body, headers=headers, method=method)
             print(f"-> {method} {url} (attempt {attempt}/{MAX_ATTEMPTS})", flush=True)
@@ -521,18 +576,12 @@ class CallEClient:
             except urllib.error.URLError as exc:
                 print(f"<- connection error: {exc.reason}", flush=True)
                 if method == "POST":
-                    # Ambiguous: no HTTP response was received, so we do
-                    # not know whether the server received and processed
-                    # this request before the connection failed. Retrying
-                    # could place a second real call. Stop instead of
-                    # guessing - GET (polling) is non-mutating and keeps
-                    # its retry below.
-                    raise RuntimeError(
-                        f"{method} {url} failed with an ambiguous connection error before any HTTP "
-                        f"response was received: {exc.reason}. This call may or may not have been "
-                        "created. Not retrying automatically - check GET /v1/calls for a call "
-                        "matching this Idempotency-Key before resubmitting."
-                    ) from exc
+                    idempotent_retry_used = self._resolve_ambiguous_post_failure(
+                        exc, url, method, headers, idempotent_retry_on_ambiguous_failure,
+                        idempotent_retry_used, "connection error",
+                    )
+                    time.sleep(BASE_BACKOFF_SECONDS)
+                    continue
                 last_error = exc
                 if attempt < MAX_ATTEMPTS:
                     delay = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
@@ -543,16 +592,14 @@ class CallEClient:
                 # Anything not already covered above (TLS/SSL errors, which
                 # are OSError subclasses and not URLError, malformed success
                 # bodies, or anything else unanticipated). Same ambiguity as
-                # URLError - no confirmed HTTP response. Fail loudly and
-                # immediately instead of letting it propagate unexplained,
-                # retrying, or silently ending the process.
+                # URLError - no confirmed HTTP response.
                 if method == "POST":
-                    raise RuntimeError(
-                        f"{method} {url} failed with an unexpected {type(exc).__name__} before any "
-                        f"HTTP response was received: {exc}. This call may or may not have been "
-                        "created. Not retrying automatically - check GET /v1/calls for a call "
-                        "matching this Idempotency-Key before resubmitting."
-                    ) from exc
+                    idempotent_retry_used = self._resolve_ambiguous_post_failure(
+                        exc, url, method, headers, idempotent_retry_on_ambiguous_failure,
+                        idempotent_retry_used, type(exc).__name__,
+                    )
+                    time.sleep(BASE_BACKOFF_SECONDS)
+                    continue
                 raise RuntimeError(
                     f"{method} {url} failed with an unexpected {type(exc).__name__}: {exc}"
                 ) from exc
@@ -589,7 +636,10 @@ class CallEClient:
 
         body = json.dumps(body_dict).encode("utf-8")
         headers = self._headers(idempotency_key)
-        return self._request("POST", "/v1/calls", headers, body)
+        return self._request(
+            "POST", "/v1/calls", headers, body,
+            idempotent_retry_on_ambiguous_failure=idempotency_key is not None,
+        )
 
     def get_call(self, call_id: str) -> dict[str, Any]:
         headers = self._headers(idempotency_key=None)

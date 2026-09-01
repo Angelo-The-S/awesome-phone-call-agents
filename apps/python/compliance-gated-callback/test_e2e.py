@@ -19,6 +19,7 @@ execute-against-a-non-real-base-url never need it.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -282,6 +283,80 @@ def test_rate_limit_is_retried_and_then_succeeds() -> None:
         assert created["status"] == "queued"
 
 
+def test_create_call_retries_once_on_ambiguous_failure_with_idempotency_key(monkeypatch) -> None:
+    """A POST that times out once then succeeds should not be treated as
+    a hard failure - CALL-E guarantees replaying the same Idempotency-Key
+    and body returns the original call instead of creating a duplicate,
+    so this one-shot retry is safe.
+    """
+    call_count = {"n": 0}
+
+    class _FakeResponse:
+        status = 201
+
+        def read(self) -> bytes:
+            return json.dumps({"id": "call_retry_test", "status": "queued"}).encode("utf-8")
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *args: object) -> bool:
+            return False
+
+    def fake_urlopen(request: object, timeout: float | None = None) -> _FakeResponse:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise TimeoutError("The read operation timed out")
+        return _FakeResponse()
+
+    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(client_module.time, "sleep", lambda seconds: None)
+
+    api_client = CallEClient(base_url="http://fake", api_key=TEST_API_KEY)
+    result = api_client.create_call(task="Call the recipient.", idempotency_key="idem-retry-test")
+
+    assert result["id"] == "call_retry_test"
+    assert call_count["n"] == 2
+
+
+def test_create_call_raises_after_retry_also_fails_ambiguously(monkeypatch) -> None:
+    call_count = {"n": 0}
+
+    def fake_urlopen(request: object, timeout: float | None = None) -> None:
+        call_count["n"] += 1
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(client_module.time, "sleep", lambda seconds: None)
+
+    api_client = CallEClient(base_url="http://fake", api_key=TEST_API_KEY)
+    with pytest.raises(RuntimeError) as exc_info:
+        api_client.create_call(task="Call the recipient.", idempotency_key="idem-retry-test-2")
+
+    assert call_count["n"] == 2
+    message = str(exc_info.value)
+    assert "safe automatic retry" in message
+    assert "Idempotency-Key was idem-retry-test-2" in message
+
+
+def test_create_call_does_not_retry_ambiguous_failure_without_idempotency_key(monkeypatch) -> None:
+    call_count = {"n": 0}
+
+    def fake_urlopen(request: object, timeout: float | None = None) -> None:
+        call_count["n"] += 1
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(client_module.time, "sleep", lambda seconds: None)
+
+    api_client = CallEClient(base_url="http://fake", api_key=TEST_API_KEY)
+    with pytest.raises(RuntimeError) as exc_info:
+        api_client.create_call(task="Call the recipient.")
+
+    assert call_count["n"] == 1
+    assert "no Idempotency-Key was available" in str(exc_info.value)
+
+
 def _run_cli(
     server_base_url: str,
     phone: str,
@@ -433,11 +508,14 @@ def test_cli_execute_derives_a_different_idempotency_key_per_invocation() -> Non
         assert server.creates == 2
 
 
-def test_cli_execute_stops_without_retry_on_ambiguous_connection_failure() -> None:
+def test_cli_execute_retries_once_then_stops_on_persistent_ambiguous_connection_failure() -> None:
     """Blocker 2: a POST that never gets an HTTP response (here, nothing
-    is listening on the target port) must fail fast with a clear message
-    instead of retrying - a blind retry could place a second real call.
-    Fast failure (no 1s/2s/4s backoff loop) is itself part of the proof.
+    is listening on the target port) gets exactly one safe retry using the
+    same Idempotency-Key (CALL-E guarantees this replays the original call
+    instead of creating a duplicate), then fails with a clear message
+    instead of retrying further - a blind, unbounded retry could place a
+    second real call. Fast failure (no 1s/2s/4s backoff loop beyond the
+    one safety-net retry) is itself part of the proof.
     """
     unreachable_base_url = "http://127.0.0.1:1"
     started = time.monotonic()
@@ -446,11 +524,16 @@ def test_cli_execute_stops_without_retry_on_ambiguous_connection_failure() -> No
 
     assert result.returncode == 1
     assert "ambiguous connection error" in result.stderr
-    assert "Not retrying automatically" in result.stderr
-    # The old retry-on-timeout behavior would take at least 1+2+4=7s of
-    # backoff across 4 attempts; failing fast should take a small fraction
-    # of that.
-    assert elapsed < 5.0
+    assert "safe automatic retry" in result.stderr
+    assert "Idempotency-Key was" in result.stderr
+    # This now makes two connection attempts (original + one safety-net
+    # retry) plus a fixed ~1s pause between them, instead of one; a
+    # hypothetical unbounded exponential-backoff retry across MAX_ATTEMPTS
+    # (4) would add far more (1+2+4=7s of sleep alone, on top of four
+    # connection attempts instead of two) - 10s comfortably distinguishes
+    # "exactly one extra attempt" from "kept retrying" while tolerating
+    # how long a single connection-refused attempt happens to take here.
+    assert elapsed < 10.0
 
 
 def test_build_hardened_task_without_business_context_is_unchanged() -> None:

@@ -475,9 +475,17 @@ another US jurisdiction rather than a country code.
   the call's own intent (phone, task, and invocation time -
   `derive_idempotency_key`), never random and never a fixed string.
 - A `POST /v1/calls` that fails with no confirmed HTTP response (a
-  timeout or connection error) is never retried automatically - a blind
-  retry could place a second real call. `GET` polling, which is
-  non-mutating, keeps retrying safely.
+  timeout or connection error) is never blindly retried, but it does get
+  exactly one safe, automatic retry using the same `Idempotency-Key`,
+  because CALL-E guarantees that replaying the same key and body returns
+  the original call instead of creating a duplicate (`calle.openapi.yaml`'s
+  `IdempotencyKey` parameter). If that single retry also fails
+  ambiguously, this app stops and says so - it never retries further or
+  guesses. `/v1/calls` has no `GET`/list method, so there is no way to
+  search for a call by `Idempotency-Key` after the fact; the error
+  message points to the CALL-E dashboard instead of a nonexistent
+  endpoint. `GET` polling, which is non-mutating, keeps retrying safely
+  on its own schedule.
 - Polling `GET /v1/calls/{id}` after a real call is placed continues
   indefinitely by default, not for a fixed timeout: this app cannot
   technically tell a call that is taking a long time because the
