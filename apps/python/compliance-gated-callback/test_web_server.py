@@ -104,6 +104,7 @@ def test_get_form_page_lists_expected_fields() -> None:
             'name="intends_to_record"',
             'name="business_context"',
             'name="entity_name"',
+            'name="agent_name"',
             'name="mode"',
         ):
             assert field in body

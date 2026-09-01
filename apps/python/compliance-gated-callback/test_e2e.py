@@ -641,23 +641,49 @@ def test_build_hardened_task_disclosure_script_comes_first() -> None:
 
 
 def test_render_disclosure_script_fills_all_placeholder_kinds() -> None:
-    result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, "Bright Smile Dental")
-    assert "[CALLER_NAME]" not in result
+    result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, "Bright Smile Dental", "Alex")
+    assert "[AGENT_NAME]" not in result
     assert "[ENTITY]" not in result
+    assert "[REASON_FOR_CALLING]" not in result
     assert "[CALLBACK_NUMBER]" not in result
     assert "Bright Smile Dental" in result
+    assert "Alex" in result
 
 
 def test_render_disclosure_script_generic_fallback_without_entity_name() -> None:
-    result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, None)
+    result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, None, None)
     assert "[ENTITY]" not in result
     assert "this organization" in result
 
 
 def test_render_disclosure_script_french_fallback() -> None:
-    result = render_disclosure_script(fr.DISCLOSURE_SCRIPT, None)
+    result = render_disclosure_script(fr.DISCLOSURE_SCRIPT, None, None)
     assert "[ENTITE]" not in result
     assert "cette organisation" in result
+
+
+def test_render_disclosure_script_agent_name_fallback_is_neutral() -> None:
+    result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, None, None)
+    assert "[AGENT_NAME]" not in result
+    assert "an automated calling agent" in result
+
+
+def test_render_disclosure_script_reason_instruction_forbids_asking_recipient() -> None:
+    result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, None, None)
+    assert "[REASON_FOR_CALLING]" not in result
+    assert "do not ask the recipient" in result
+
+
+def test_render_disclosure_script_reason_comes_before_closing_statement() -> None:
+    en_result = render_disclosure_script(us_federal.DISCLOSURE_SCRIPT, None, None)
+    reason_index = en_result.index("state briefly and naturally why you are calling")
+    closing_index = en_result.index("This call uses an artificial voice")
+    assert reason_index < closing_index
+
+    fr_result = render_disclosure_script(fr.DISCLOSURE_SCRIPT, None, None)
+    reason_index_fr = fr_result.index("expliquez brievement")
+    closing_index_fr = fr_result.index("Vous pouvez demander")
+    assert reason_index_fr < closing_index_fr
 
 
 def test_default_intent_result_schema_answered_by_is_optional() -> None:
@@ -707,7 +733,7 @@ def test_cli_execute_sends_hardened_task_to_api() -> None:
         # disclosure_script, and this test's flags pass no --entity-name.
         chain = resolve_jurisdiction_chain(FR_PHONE)
         _, _, disclosure_template = resolve_locale_and_region(chain)
-        expected_disclosure = render_disclosure_script(disclosure_template, None)
+        expected_disclosure = render_disclosure_script(disclosure_template, None, None)
         assert record.payload["task"] == build_hardened_task(operator_task, disclosure_script=expected_disclosure)
 
 
@@ -724,8 +750,8 @@ def test_cli_execute_sends_ai_disclosure_to_call_e() -> None:
         assert result.returncode == 0, result.stderr
         (record,) = server.fake.calls.values()
         task_sent = record.payload["task"]
-        assert "intelligence artificielle" in task_sent
-        assert task_sent.index("intelligence artificielle") < task_sent.index(operator_task)
+        assert "assistant vocal IA" in task_sent
+        assert task_sent.index("assistant vocal IA") < task_sent.index(operator_task)
 
 
 def test_cli_entity_name_fills_disclosure_placeholder() -> None:
@@ -738,6 +764,18 @@ def test_cli_entity_name_fills_disclosure_placeholder() -> None:
         assert "Bright Smile Dental" in result.stdout
         assert "[ENTITY]" not in result.stdout
         assert "[ENTITE]" not in result.stdout
+        assert "[REASON_FOR_CALLING]" not in result.stdout
+        assert "[RAISON_APPEL]" not in result.stdout
+
+
+def test_cli_agent_name_fills_disclosure_placeholder() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, [*FR_COMPLIANT_FLAGS, "--agent-name", "Alex"])
+
+        assert result.returncode == 0, result.stderr
+        assert "Alex" in result.stdout
+        assert "[AGENT_NAME]" not in result.stdout
+        assert "[NOM_AGENT]" not in result.stdout
 
 
 def test_cli_execute_result_includes_manipulation_flag() -> None:

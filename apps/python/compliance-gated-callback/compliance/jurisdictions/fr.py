@@ -27,9 +27,9 @@ AFTERNOON_WINDOW = (14, 20)
 ALLOWED_WEEKDAYS = range(0, 5)  # Monday=0 .. Friday=4
 
 DISCLOSURE_SCRIPT = (
-    "Bonjour, cet appel est passe par un systeme d'intelligence artificielle "
-    "pour le compte de [ENTITE]. Vous pouvez demander a parler a une personne "
-    "ou raccrocher a tout moment."
+    "Bonjour, je suis [NOM_AGENT], l'assistant vocal IA de [ENTITE], et je vous appelle "
+    "[RAISON_APPEL] "
+    "Vous pouvez demander a parler a une personne ou raccrocher a tout moment."
 )
 
 RULES = JurisdictionRules(
