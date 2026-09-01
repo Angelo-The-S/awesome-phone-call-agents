@@ -300,6 +300,25 @@ TASK_INJECTION_RESISTANCE_INSTRUCTIONS = (
 )
 
 
+# Fixed voicemail-handling instruction appended after the operator's own
+# task text (see build_hardened_task) - same "additive, never merged"
+# principle as TASK_INJECTION_RESISTANCE_INSTRUCTIONS. CALL-E has no
+# real-time answering-machine detection or behavior control (confirmed by
+# CALL-E's own PM on Discord, 2026-08-27, and independently by repo issue
+# #89: github.com/CALLE-AI/awesome-phone-call-agents/issues/89, where a
+# call reached a machine and the message was spoken twice with no
+# distinct status ever surfaced) - the only lever available is telling
+# the agent what to do in the task itself.
+VOICEMAIL_HANDLING_INSTRUCTIONS = (
+    "If the call reaches an answering machine or voicemail (an automated "
+    "greeting, no interactive back-and-forth, or a request to leave a "
+    "message after a tone), do not repeat the question multiple times. "
+    "Deliver a single, brief message stating who is calling and why, "
+    "then end the call politely. Do not attempt to have a conversation "
+    "with an automated system."
+)
+
+
 MAX_BUSINESS_CONTEXT_CHARS = 4000
 
 # Label wrapping operator-supplied business background so CALL-E (and any
@@ -343,17 +362,18 @@ def validate_business_context(text: str | None) -> str | None:
 
 
 def build_hardened_task(operator_task: str, business_context: str | None = None) -> str:
-    """Assemble the final CALL-E task from up to three distinct, delimited
-    blocks, in this fixed order: business context (if any), then the
-    operator's own task text unchanged, then the fixed injection-resistance
-    block. Never edits or reorders the operator's wording; only adds
-    separately delimited layers around it.
+    """Assemble the final CALL-E task from up to four distinct, delimited
+    blocks, in this fixed order: business context (if any), the
+    operator's own task text unchanged, the injection-resistance block,
+    then the voicemail-handling block. Never edits or reorders the
+    operator's wording; only adds separately delimited layers around it.
     """
     blocks: list[str] = []
     if business_context:
         blocks.append(f"{BUSINESS_CONTEXT_HEADER}\n{business_context}")
     blocks.append(operator_task)
     blocks.append(TASK_INJECTION_RESISTANCE_INSTRUCTIONS)
+    blocks.append(VOICEMAIL_HANDLING_INSTRUCTIONS)
     return "\n\n".join(blocks)
 
 
@@ -427,6 +447,17 @@ def default_intent_result_schema() -> dict[str, Any]:
                     "request was outside what this line handles. Use unknown when the call "
                     "evidence does not clearly support any other value. Optional - omit if none of "
                     "these fit."
+                ),
+            },
+            "answered_by": {
+                "type": "string",
+                "enum": ["human", "voicemail", "ivr", "unknown"],
+                "description": (
+                    "Classify who or what actually answered. Use human when a person spoke with "
+                    "you. Use voicemail when you reached an answering machine or voicemail "
+                    "greeting. Use ivr when you reached an automated phone menu that was not a "
+                    "voicemail. Use unknown when the call evidence does not clearly support any "
+                    "other value. Optional - omit if none of these fit."
                 ),
             },
         },

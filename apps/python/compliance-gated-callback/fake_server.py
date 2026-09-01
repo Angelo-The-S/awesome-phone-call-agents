@@ -117,6 +117,12 @@ def structured_result_for(result_schema: dict[str, Any] | None) -> dict[str, Any
         # always reports none.
         result["manipulation_attempt_detected"] = False
 
+    if "answered_by" in properties:
+        # Fake server has no real call evidence; always simulates the
+        # happy path (reached a human), consistent with its canned
+        # "Hello from the fake server." / "Understood, goodbye." transcript.
+        result["answered_by"] = "human"
+
     return result
 
 
