@@ -35,6 +35,7 @@ from client import (
     MAX_BUSINESS_CONTEXT_CHARS,
     REAL_API_BASE_URL,
     TASK_INJECTION_RESISTANCE_INSTRUCTIONS,
+    VOICEMAIL_HANDLING_INSTRUCTIONS,
     CallEAPIError,
     CallEClient,
     LiveCallBlockedError,
@@ -111,6 +112,7 @@ def test_create_and_poll_reaches_completed_with_intent_result() -> None:
             "next_action": "schedule_callback",
             "confidence_note": "Fake server: deterministic canned result, not extracted from real call evidence.",
             "manipulation_attempt_detected": False,
+            "answered_by": "human",
         }
         assert final_call["recipients"][0]["locale"] == "fr-FR"
         assert final_call["recipients"][0]["region"] == "FR"
@@ -453,7 +455,10 @@ def test_cli_execute_stops_without_retry_on_ambiguous_connection_failure() -> No
 
 def test_build_hardened_task_without_business_context_is_unchanged() -> None:
     operator_task = "Call the recipient and find out why they are calling in."
-    assert build_hardened_task(operator_task) == f"{operator_task}\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
+    expected = (
+        f"{operator_task}\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}\n\n{VOICEMAIL_HANDLING_INSTRUCTIONS}"
+    )
+    assert build_hardened_task(operator_task) == expected
 
 
 def test_build_hardened_task_orders_context_before_task_before_resistance_block() -> None:
@@ -476,6 +481,7 @@ def test_build_hardened_task_business_context_is_a_separate_block() -> None:
         f"{BUSINESS_CONTEXT_HEADER}\n{business_context}"
         f"\n\n{operator_task}"
         f"\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
+        f"\n\n{VOICEMAIL_HANDLING_INSTRUCTIONS}"
     )
     assert result == expected
 
@@ -518,6 +524,23 @@ def test_default_intent_result_schema_topic_handled_is_optional() -> None:
     ]
 
 
+def test_build_hardened_task_includes_voicemail_handling_instructions() -> None:
+    operator_task = "Call the recipient and find out why they are calling in."
+    result = build_hardened_task(operator_task)
+
+    assert VOICEMAIL_HANDLING_INSTRUCTIONS in result
+    resistance_index = result.index(TASK_INJECTION_RESISTANCE_INSTRUCTIONS)
+    voicemail_index = result.index(VOICEMAIL_HANDLING_INSTRUCTIONS)
+    assert resistance_index < voicemail_index
+
+
+def test_default_intent_result_schema_answered_by_is_optional() -> None:
+    schema = default_intent_result_schema()
+    assert "answered_by" in schema["properties"]
+    assert "answered_by" not in schema["required"]
+    assert schema["properties"]["answered_by"]["enum"] == ["human", "voicemail", "ivr", "unknown"]
+
+
 def test_cli_task_is_hardened_with_injection_resistance_instructions() -> None:
     """The operator's own task text and the fixed safety block must both
     appear in the printed request body - additive, not a rewrite.
@@ -533,6 +556,16 @@ def test_cli_task_is_hardened_with_injection_resistance_instructions() -> None:
         assert server.creates == 0
 
 
+def test_cli_dry_run_shows_voicemail_handling_instructions() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, FR_COMPLIANT_FLAGS)
+
+        assert result.returncode == 0, result.stderr
+        assert "answering machine" in result.stdout
+        assert "voicemail" in result.stdout
+        assert "do not repeat the question multiple times" in result.stdout
+
+
 def test_cli_execute_sends_hardened_task_to_api() -> None:
     """Proves what is actually transmitted to POST /v1/calls, not just
     what is printed: reads the fake server's own stored payload.
@@ -545,7 +578,6 @@ def test_cli_execute_sends_hardened_task_to_api() -> None:
         assert server.creates == 1
         (record,) = server.fake.calls.values()
         assert record.payload["task"] == build_hardened_task(operator_task)
-        assert record.payload["task"] == f"{operator_task}\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
 
 
 def test_cli_execute_result_includes_manipulation_flag() -> None:

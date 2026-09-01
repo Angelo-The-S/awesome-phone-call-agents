@@ -322,6 +322,38 @@ records after the fact which kind of question the call actually
 covered - useful for showing the same agent handled more than one topic
 type across calls.
 
+## Voicemail handling
+
+A real call (`call_H40fqmT3Thwz0GhSI2m7xg`) reached an answering machine
+and, with no instruction telling it otherwise, repeated its full opening
+pitch three times over about 35 seconds instead of leaving one message
+and hanging up. `build_hardened_task` now appends a fourth fixed block,
+`VOICEMAIL_HANDLING_INSTRUCTIONS`, after the injection-resistance block:
+it tells the agent that if it reaches an automated greeting with no
+interactive back-and-forth, it should deliver one brief message stating
+who is calling and why, then end the call - not repeat itself.
+
+**Honest limit, confirmed by CALL-E itself**: this app cannot make
+CALL-E behave differently *during* a call beyond what the task text
+asks. CALL-E's own PM confirmed directly on Discord (2026-08-27) that
+there is no real-time answering-machine detection or behavior control -
+the only official mechanism is post-call classification through a
+developer-defined `result_schema` field. That is exactly what the new
+optional `answered_by` field
+(`human | voicemail | ivr | unknown`) is: it lets an operator see, after
+the fact, whether a given call reached a person, a machine, or an IVR -
+it does not and cannot change what happened live on that call.
+
+This is not a problem unique to this app.
+[Issue #89](https://github.com/CALLE-AI/awesome-phone-call-agents/issues/89)
+in this repo independently documents the same failure mode: a call
+reached a machine, its message was spoken twice, and no distinct
+voicemail status ever surfaced anywhere in the response. Two other apps
+in this repo hit the identical gap and solved it the same way, at the
+task/app layer rather than relying on a platform feature that does not
+exist: `ringedingeding` ([PR #146](https://github.com/CALLE-AI/awesome-phone-call-agents/pull/146))
+and `researchcall-survey` ([PR #145](https://github.com/CALLE-AI/awesome-phone-call-agents/pull/145)).
+
 ## Web UI
 
 `web_server.py` is a single-page HTML form over the exact same
