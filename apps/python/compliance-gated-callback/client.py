@@ -375,25 +375,53 @@ def validate_business_context(text: str | None) -> str | None:
 # is the fix.
 DISCLOSURE_INSTRUCTION_HEADER = (
     "Required disclosure - say this, in substance, near the start of the call, before any "
-    "other content below:"
+    "other content below. Text in [square brackets] within it is an instruction for you to "
+    "fill in with real, appropriate content - never say the brackets or the instruction text "
+    "itself out loud:"
 )
 
 
-def render_disclosure_script(script: str, entity_name: str | None) -> str:
-    """Fill a jurisdiction's disclosure_script placeholders with the
-    operator-supplied business name, or an honest generic fallback when
-    none is given. [CALLBACK_NUMBER] has no equivalent concept in this
-    app (CALL-E's outbound number is not guaranteed to accept inbound
-    calls) - inventing one would be actively misleading, so it is
-    replaced with a phrase that identifies the number without asserting
-    it is reachable.
+def render_disclosure_script(script: str, entity_name: str | None, agent_name: str | None) -> str:
+    """Fill a jurisdiction's disclosure_script placeholders. [ENTITY]/
+    [ENTITE] and [AGENT_NAME]/[NOM_AGENT] get real operator-supplied text
+    or an honest generic fallback, same principle as before.
+    [REASON_FOR_CALLING]/[RAISON_APPEL] cannot be filled with real text
+    here - this app has no reliable way to summarize an arbitrary
+    operator --task into a short phrase - so it is replaced with a
+    bracketed instruction telling CALL-E's own model to state the reason
+    itself, based on the task text that follows later in the same
+    message, and explicitly not to ask the recipient for it (the exact
+    defect a real call surfaced: the agent asked the recipient why it
+    was calling instead of saying so). [CALLBACK_NUMBER] has no
+    equivalent concept in this app (CALL-E's outbound number is not
+    guaranteed to accept inbound calls) - inventing one would be
+    actively misleading, so it is replaced with a phrase that identifies
+    the number without asserting it is reachable.
     """
     entity = entity_name or "this organization"
     entity_fr = entity_name or "cette organisation"
+    # Not "the voice assistant"/"l'assistant vocal" - every script already
+    # says "the AI voice assistant for .../l'assistant vocal IA de ..." as
+    # a fixed clause right after this slot, so that fallback would repeat
+    # itself ("I'm the voice assistant, the AI voice assistant for...").
+    agent = agent_name or "an automated calling agent"
+    agent_fr = agent_name or "un agent d'appel automatise"
+    reason = (
+        "[state briefly and naturally why you are calling, based on the call's objective "
+        "described later in this message - do not ask the recipient why you are calling]."
+    )
+    reason_fr = (
+        "[expliquez brievement et naturellement la raison de votre appel, d'apres l'objectif "
+        "de l'appel decrit plus loin dans ce message - ne demandez pas au destinataire "
+        "pourquoi vous appelez]."
+    )
     return (
         script.replace("[ENTITY]", entity)
         .replace("[ENTITE]", entity_fr)
-        .replace("[CALLER_NAME]", "an automated calling system")
+        .replace("[AGENT_NAME]", agent)
+        .replace("[NOM_AGENT]", agent_fr)
+        .replace("[REASON_FOR_CALLING]", reason)
+        .replace("[RAISON_APPEL]", reason_fr)
         .replace("[CALLBACK_NUMBER]", "the number that just called you")
     )
 
@@ -863,6 +891,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "script (e.g. 'Bright Smile Dental'). Omit to use a generic, honest fallback phrase "
         "instead of a fabricated name.",
     )
+    parser.add_argument(
+        "--agent-name",
+        default=None,
+        help="First name to give the AI voice agent in the required disclosure script (e.g. "
+        "'Alex'). Omit to use a neutral, honest fallback ('the voice assistant') instead of an "
+        "invented name.",
+    )
     return parser.parse_args(argv)
 
 
@@ -886,7 +921,7 @@ def main(argv: list[str] | None = None) -> int:
     decision = run_precall_checks(context)
     locale, region, disclosure_script_template = resolve_locale_and_region(decision.jurisdiction_chain)
     disclosure_script = (
-        render_disclosure_script(disclosure_script_template, args.entity_name)
+        render_disclosure_script(disclosure_script_template, args.entity_name, args.agent_name)
         if disclosure_script_template
         else None
     )

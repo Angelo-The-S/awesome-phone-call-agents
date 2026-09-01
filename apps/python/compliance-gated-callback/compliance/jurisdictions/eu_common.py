@@ -16,7 +16,8 @@ from ..models import (
 )
 
 DISCLOSURE_SCRIPT = (
-    "This call is made by an artificial intelligence system on behalf of [ENTITY]. "
+    "Hello, I'm [AGENT_NAME], an artificial intelligence voice assistant calling on behalf "
+    "of [ENTITY], and I'm calling [REASON_FOR_CALLING] "
     "You can ask to speak with a person or end this call at any time."
 )
 

@@ -80,20 +80,48 @@ sends it as a real, separately delimited block - and puts it **first**,
 before business context or the operator's own task, because disclosure
 has to happen at the very start of the call, not after other content.
 
-The scripts contain placeholders (`[ENTITY]`/`[ENTITE]`, `[CALLER_NAME]`,
+**Second real defect, also found by testing**: the script correctly said
+"this is an AI," but never said *why* it was calling - it asked the
+recipient to explain instead, which is backwards. The disclosure
+scripts now follow one structure in every jurisdiction: identity and
+entity, **then the reason for the call**, then the closing
+rights/callback statement - for example (France):
+`"Bonjour, je suis [agent], l'assistant vocal IA de [entite], et je vous
+appelle [raison]. Vous pouvez demander a parler a une personne ou
+raccrocher a tout moment."`
+
+The scripts contain placeholders (`[ENTITY]`/`[ENTITE]`,
+`[AGENT_NAME]`/`[NOM_AGENT]`, `[REASON_FOR_CALLING]`/`[RAISON_APPEL]`,
 `[CALLBACK_NUMBER]`) that must never reach CALL-E as literal bracket
 text - a voice agent would say the brackets out loud. `--entity-name`
 (CLI and web form) lets an operator supply their real business name to
-fill `[ENTITY]`/`[ENTITE]`; omitting it uses an honest, generic fallback
-(`"this organization"` / `"cette organisation"`) rather than a
-fabricated business name. `[CALLER_NAME]` always becomes `"an automated
-calling system"` - this app has no bot-persona-name concept, and the
-next sentence in every script already states the AI disclosure
-explicitly. `[CALLBACK_NUMBER]` always becomes `"the number that just
-called you"` - this app has no distinct callback-number concept
-(CALL-E's outbound caller ID is not guaranteed to accept inbound calls),
-so inventing a specific number would be actively misleading; this
-phrasing identifies the number without asserting it is reachable.
+fill `[ENTITY]`/`[ENTITE]`; `--agent-name` does the same for the AI
+agent's first name. Omitting either uses an honest, generic fallback
+(`"this organization"` / `"cette organisation"`,
+`"an automated calling agent"` / `"un agent d'appel automatise"`)
+rather than a fabricated name. `[CALLBACK_NUMBER]` always becomes `"the
+number that just called you"` - this app has no distinct
+callback-number concept (CALL-E's outbound caller ID is not guaranteed
+to accept inbound calls), so inventing a specific number would be
+actively misleading; this phrasing identifies the number without
+asserting it is reachable.
+
+The reason for calling is the one placeholder this app deliberately
+does *not* try to fill with real text. `--task` is free-form text with
+no fixed shape ("Call the recipient and find out why they are calling
+in.", "Answer the recipient's questions about our practice.", ...) -
+there is no reliable string operation that turns arbitrary text like
+that into a short spoken reason, and guessing at one would be exactly
+the kind of fragile heuristic this app avoids everywhere else.
+`[REASON_FOR_CALLING]`/`[RAISON_APPEL]` is instead replaced with a
+bracketed instruction telling CALL-E's own model to state the reason
+itself, based on the `--task` text that immediately follows in the same
+message, and explicitly **not** to ask the recipient for it. This
+relies on the model correctly treating bracketed text as an instruction
+to fill in rather than something to say verbatim
+(`DISCLOSURE_INSTRUCTION_HEADER` says so explicitly) - the same class of
+reliability limit already documented under Prompt injection resistance
+below, not a hard guarantee.
 
 ```bash
 uv run python client.py \
@@ -101,7 +129,8 @@ uv run python client.py \
   --phone +33639980456 \
   --consent-obtained --dnc-checked --gdpr-basis-documented \
   --recipient-timezone Europe/Paris \
-  --entity-name "Bright Smile Dental"
+  --entity-name "Bright Smile Dental" \
+  --agent-name "Alex"
 ```
 
 ## Legal disclaimer and known gray areas

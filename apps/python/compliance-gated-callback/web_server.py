@@ -68,6 +68,9 @@ FORM_PAGE = """<!doctype html>
   <p><label>Entity name for the required AI-disclosure script (optional - a generic, honest
      fallback phrase is used if left blank)<br>
      <input type="text" name="entity_name" placeholder="Bright Smile Dental"></label></p>
+  <p><label>Agent first name for the required AI-disclosure script (optional - a neutral,
+     honest fallback is used if left blank, never an invented name)<br>
+     <input type="text" name="agent_name" placeholder="Alex"></label></p>
   <p><label><input type="checkbox" name="consent_obtained" value="1"> Consent obtained</label><br>
      <label>Consent timestamp (ISO 8601 UTC, optional - defaults to now)<br>
        <input type="text" name="consent_timestamp" placeholder="2026-08-20T12:00:00Z"></label></p>
@@ -184,6 +187,7 @@ class Handler(BaseHTTPRequestHandler):
         solicitations_raw = _first(form, "solicitations_in_last_24h")
         business_context_raw = _first(form, "business_context") or None
         entity_name = _first(form, "entity_name") or None
+        agent_name = _first(form, "agent_name") or None
 
         try:
             consent_timestamp = (
@@ -212,7 +216,7 @@ class Handler(BaseHTTPRequestHandler):
         decision = run_precall_checks(context)
         locale, region, disclosure_script_template = resolve_locale_and_region(decision.jurisdiction_chain)
         disclosure_script = (
-            render_disclosure_script(disclosure_script_template, entity_name)
+            render_disclosure_script(disclosure_script_template, entity_name, agent_name)
             if disclosure_script_template
             else None
         )
