@@ -445,6 +445,28 @@ task/app layer rather than relying on a platform feature that does not
 exist: `ringedingeding` ([PR #146](https://github.com/CALLE-AI/awesome-phone-call-agents/pull/146))
 and `researchcall-survey` ([PR #145](https://github.com/CALLE-AI/awesome-phone-call-agents/pull/145)).
 
+## Call closing
+
+A real call (`call_oUjPdPH-752n7uPzxDYZhg`) showed the agent end the
+call immediately after a bare "oui," with no recap of what was decided
+- cutting the recipient off mid-reply ("okay au..."). `build_hardened_task`
+now appends a sixth fixed block, `CALL_CLOSING_INSTRUCTIONS`, last
+(after the voicemail-handling block): it tells the agent to give a
+clear, brief recap of what was decided and what happens next before
+ending the call, and to never be the one to hang up first - it should
+wait for an explicit signal from the recipient ("goodbye," "that's
+all," "thank you") and keep the conversation open until then, rather
+than assume a short reply means the call is over.
+
+**Honest limit, same as voicemail handling**: this is a prompt-level
+instruction, not a control this app executes or can verify. CALL-E
+offers no real-time hook for managing call flow - there is no way for
+this app to detect that the agent is about to hang up, or to hold the
+line open itself. If the model doesn't follow the instruction, nothing
+here catches it; the only feedback available is reviewing the
+transcript afterward, exactly how this issue was found in the first
+place.
+
 ## Web UI
 
 `web_server.py` is a single-page HTML form over the exact same

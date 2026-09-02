@@ -323,6 +323,24 @@ VOICEMAIL_HANDLING_INSTRUCTIONS = (
 )
 
 
+# Fixed call-closing instruction appended after the voicemail-handling
+# block (see build_hardened_task) - same "additive, never merged"
+# principle as the other fixed blocks. A real call
+# (call_oUjPdPH-752n7uPzxDYZhg) showed the agent end the call right
+# after a bare "oui," with no recap, cutting the recipient off mid-reply
+# ("okay au...") - CALL-E has no real-time control this app can exercise
+# over call flow, so the only lever is instructing the agent directly.
+CALL_CLOSING_INSTRUCTIONS = (
+    "Before ending the call, give a clear, brief recap of what was decided or agreed and "
+    "what happens next - never end the call right after a short reply like 'yes' or 'okay' "
+    "without first summarizing the outcome. Never be the one to hang up first: wait for the "
+    "recipient to give an explicit signal that the call is over (for example 'goodbye', "
+    "'that's all', or 'thank you') before considering it finished. Until you hear that "
+    "signal, keep the conversation open in case the recipient has anything else to add - do "
+    "not cut them off mid-reply."
+)
+
+
 MAX_BUSINESS_CONTEXT_CHARS = 4000
 
 # Label wrapping operator-supplied business background so CALL-E (and any
@@ -431,13 +449,14 @@ def build_hardened_task(
     business_context: str | None = None,
     disclosure_script: str | None = None,
 ) -> str:
-    """Assemble the final CALL-E task from up to five distinct, delimited
+    """Assemble the final CALL-E task from up to six distinct, delimited
     blocks, in this fixed order: the jurisdiction's AI-disclosure script
     (if any) FIRST - disclosure must happen at the very start of the
     call, not buried after other content - then business context (if
     any), the operator's own task text unchanged, the injection-resistance
-    block, then the voicemail-handling block. Never edits or reorders the
-    operator's wording; only adds separately delimited layers around it.
+    block, the voicemail-handling block, then the call-closing block
+    LAST. Never edits or reorders the operator's wording; only adds
+    separately delimited layers around it.
     """
     blocks: list[str] = []
     if disclosure_script:
@@ -447,6 +466,7 @@ def build_hardened_task(
     blocks.append(operator_task)
     blocks.append(TASK_INJECTION_RESISTANCE_INSTRUCTIONS)
     blocks.append(VOICEMAIL_HANDLING_INSTRUCTIONS)
+    blocks.append(CALL_CLOSING_INSTRUCTIONS)
     return "\n\n".join(blocks)
 
 
