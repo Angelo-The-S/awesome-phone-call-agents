@@ -33,6 +33,7 @@ import pytest
 import client as client_module
 from client import (
     BUSINESS_CONTEXT_HEADER,
+    CALL_CLOSING_INSTRUCTIONS,
     DISCLOSURE_INSTRUCTION_HEADER,
     MAX_BUSINESS_CONTEXT_CHARS,
     REAL_API_BASE_URL,
@@ -543,7 +544,8 @@ def test_cli_execute_retries_once_then_stops_on_persistent_ambiguous_connection_
 def test_build_hardened_task_without_business_context_is_unchanged() -> None:
     operator_task = "Call the recipient and find out why they are calling in."
     expected = (
-        f"{operator_task}\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}\n\n{VOICEMAIL_HANDLING_INSTRUCTIONS}"
+        f"{operator_task}\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
+        f"\n\n{VOICEMAIL_HANDLING_INSTRUCTIONS}\n\n{CALL_CLOSING_INSTRUCTIONS}"
     )
     assert build_hardened_task(operator_task) == expected
 
@@ -569,6 +571,7 @@ def test_build_hardened_task_business_context_is_a_separate_block() -> None:
         f"\n\n{operator_task}"
         f"\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
         f"\n\n{VOICEMAIL_HANDLING_INSTRUCTIONS}"
+        f"\n\n{CALL_CLOSING_INSTRUCTIONS}"
     )
     assert result == expected
 
@@ -636,8 +639,26 @@ def test_build_hardened_task_disclosure_script_comes_first() -> None:
     task_index = result.index(operator_task)
     resistance_index = result.index(TASK_INJECTION_RESISTANCE_INSTRUCTIONS)
     voicemail_index = result.index(VOICEMAIL_HANDLING_INSTRUCTIONS)
-    assert disclosure_index < context_index < task_index < resistance_index < voicemail_index
+    closing_index = result.index(CALL_CLOSING_INSTRUCTIONS)
+    assert (
+        disclosure_index
+        < context_index
+        < task_index
+        < resistance_index
+        < voicemail_index
+        < closing_index
+    )
     assert disclosure_script in result
+
+
+def test_build_hardened_task_call_closing_comes_last() -> None:
+    operator_task = "Call the recipient and find out why they are calling in."
+    result = build_hardened_task(operator_task)
+
+    assert CALL_CLOSING_INSTRUCTIONS in result
+    voicemail_index = result.index(VOICEMAIL_HANDLING_INSTRUCTIONS)
+    closing_index = result.index(CALL_CLOSING_INSTRUCTIONS)
+    assert voicemail_index < closing_index
 
 
 def test_render_disclosure_script_fills_all_placeholder_kinds() -> None:
@@ -716,6 +737,16 @@ def test_cli_dry_run_shows_voicemail_handling_instructions() -> None:
         assert "answering machine" in result.stdout
         assert "voicemail" in result.stdout
         assert "do not repeat the question multiple times" in result.stdout
+
+
+def test_cli_dry_run_shows_call_closing_instructions() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, FR_COMPLIANT_FLAGS)
+
+        assert result.returncode == 0, result.stderr
+        assert "never end the call right after" in result.stdout
+        assert "wait for the" in result.stdout
+        assert "do not cut them off" in result.stdout
 
 
 def test_cli_execute_sends_hardened_task_to_api() -> None:
