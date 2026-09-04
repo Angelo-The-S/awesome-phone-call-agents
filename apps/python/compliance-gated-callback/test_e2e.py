@@ -36,6 +36,8 @@ from client import (
     CALL_CLOSING_INSTRUCTIONS,
     DISCLOSURE_INSTRUCTION_HEADER,
     MAX_BUSINESS_CONTEXT_CHARS,
+    NO_REPEAT_OPENING_INSTRUCTIONS,
+    PROACTIVE_NEXT_STEP_INSTRUCTIONS,
     REAL_API_BASE_URL,
     TASK_INJECTION_RESISTANCE_INSTRUCTIONS,
     VOICEMAIL_HANDLING_INSTRUCTIONS,
@@ -545,7 +547,10 @@ def test_build_hardened_task_without_business_context_is_unchanged() -> None:
     operator_task = "Call the recipient and find out why they are calling in."
     expected = (
         f"{operator_task}\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
-        f"\n\n{VOICEMAIL_HANDLING_INSTRUCTIONS}\n\n{CALL_CLOSING_INSTRUCTIONS}"
+        f"\n\n{VOICEMAIL_HANDLING_INSTRUCTIONS}"
+        f"\n\n{NO_REPEAT_OPENING_INSTRUCTIONS}"
+        f"\n\n{PROACTIVE_NEXT_STEP_INSTRUCTIONS}"
+        f"\n\n{CALL_CLOSING_INSTRUCTIONS}"
     )
     assert build_hardened_task(operator_task) == expected
 
@@ -571,6 +576,8 @@ def test_build_hardened_task_business_context_is_a_separate_block() -> None:
         f"\n\n{operator_task}"
         f"\n\n{TASK_INJECTION_RESISTANCE_INSTRUCTIONS}"
         f"\n\n{VOICEMAIL_HANDLING_INSTRUCTIONS}"
+        f"\n\n{NO_REPEAT_OPENING_INSTRUCTIONS}"
+        f"\n\n{PROACTIVE_NEXT_STEP_INSTRUCTIONS}"
         f"\n\n{CALL_CLOSING_INSTRUCTIONS}"
     )
     assert result == expected
@@ -639,6 +646,8 @@ def test_build_hardened_task_disclosure_script_comes_first() -> None:
     task_index = result.index(operator_task)
     resistance_index = result.index(TASK_INJECTION_RESISTANCE_INSTRUCTIONS)
     voicemail_index = result.index(VOICEMAIL_HANDLING_INSTRUCTIONS)
+    no_repeat_index = result.index(NO_REPEAT_OPENING_INSTRUCTIONS)
+    proactive_index = result.index(PROACTIVE_NEXT_STEP_INSTRUCTIONS)
     closing_index = result.index(CALL_CLOSING_INSTRUCTIONS)
     assert (
         disclosure_index
@@ -646,6 +655,8 @@ def test_build_hardened_task_disclosure_script_comes_first() -> None:
         < task_index
         < resistance_index
         < voicemail_index
+        < no_repeat_index
+        < proactive_index
         < closing_index
     )
     assert disclosure_script in result
@@ -747,6 +758,25 @@ def test_cli_dry_run_shows_call_closing_instructions() -> None:
         assert "never end the call right after" in result.stdout
         assert "wait for the" in result.stdout
         assert "do not cut them off" in result.stdout
+
+
+def test_cli_dry_run_shows_no_repeat_opening_instructions() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, FR_COMPLIANT_FLAGS)
+
+        assert result.returncode == 0, result.stderr
+        assert "do not repeat it in full again" in result.stdout
+        assert "do not restart your opening" in result.stdout
+        assert "never as a signal to start over" in result.stdout
+
+
+def test_cli_dry_run_shows_proactive_next_step_instructions() -> None:
+    with FakeCalleServer() as server:
+        result = _run_cli(server.base_url, FR_PHONE, FR_COMPLIANT_FLAGS)
+
+        assert result.returncode == 0, result.stderr
+        assert "proactively suggest a concrete next step" in result.stdout
+        assert "instead of waiting silently" in result.stdout
 
 
 def test_cli_execute_sends_hardened_task_to_api() -> None:

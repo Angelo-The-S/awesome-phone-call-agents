@@ -323,6 +323,36 @@ VOICEMAIL_HANDLING_INSTRUCTIONS = (
 )
 
 
+# Fixed instruction telling the agent never to restart its opening once
+# already delivered - same "additive, never merged" principle as the
+# other fixed blocks. Two real calls now (call_ErzDUKAIYUaBdnoRNhdNkw,
+# and the very first live call in this project) showed the agent treat
+# a short, unclear, or interrupting reply as a cue to restart its
+# opening from scratch rather than continue the conversation.
+# VOICEMAIL_HANDLING_INSTRUCTIONS only ever covered this for the
+# voicemail case specifically; this generalizes it to live replies too.
+NO_REPEAT_OPENING_INSTRUCTIONS = (
+    "Once you have delivered your opening (the AI disclosure and the reason for calling) one "
+    "time, do not repeat it in full again for the rest of this call, no matter what happens "
+    "next. If the recipient's reply is brief, hesitant, unclear, or sounds like an "
+    "interruption, do not restart your opening - continue the conversation naturally from "
+    "where it left off, or ask a short clarifying question if you did not understand them. "
+    "Treat any short reply, such as just repeating your name back or saying 'okay' or 'yes', "
+    "as something to respond to, never as a signal to start over."
+)
+
+
+# Fixed instruction encouraging the agent to drive the call forward
+# instead of waiting to be asked. Same "additive, never merged"
+# principle as the other fixed blocks.
+PROACTIVE_NEXT_STEP_INSTRUCTIONS = (
+    "After you answer a question or share information, proactively suggest a concrete next "
+    "step that fits what was just discussed - for example offering to schedule an "
+    "appointment, transfer to a person, or send more details - instead of waiting silently "
+    "for the recipient to ask what happens next."
+)
+
+
 # Fixed call-closing instruction appended after the voicemail-handling
 # block (see build_hardened_task) - same "additive, never merged"
 # principle as the other fixed blocks. A real call
@@ -449,14 +479,16 @@ def build_hardened_task(
     business_context: str | None = None,
     disclosure_script: str | None = None,
 ) -> str:
-    """Assemble the final CALL-E task from up to six distinct, delimited
-    blocks, in this fixed order: the jurisdiction's AI-disclosure script
+    """Assemble the final CALL-E task from up to eight distinct,
+    delimited blocks, in this fixed order, which roughly follows the
+    chronological arc of a call: the jurisdiction's AI-disclosure script
     (if any) FIRST - disclosure must happen at the very start of the
     call, not buried after other content - then business context (if
     any), the operator's own task text unchanged, the injection-resistance
-    block, the voicemail-handling block, then the call-closing block
-    LAST. Never edits or reorders the operator's wording; only adds
-    separately delimited layers around it.
+    block, the voicemail-handling block, the no-repeat-opening block, the
+    proactive-next-step block, then the call-closing block LAST. Never
+    edits or reorders the operator's wording; only adds separately
+    delimited layers around it.
     """
     blocks: list[str] = []
     if disclosure_script:
@@ -466,6 +498,8 @@ def build_hardened_task(
     blocks.append(operator_task)
     blocks.append(TASK_INJECTION_RESISTANCE_INSTRUCTIONS)
     blocks.append(VOICEMAIL_HANDLING_INSTRUCTIONS)
+    blocks.append(NO_REPEAT_OPENING_INSTRUCTIONS)
+    blocks.append(PROACTIVE_NEXT_STEP_INSTRUCTIONS)
     blocks.append(CALL_CLOSING_INSTRUCTIONS)
     return "\n\n".join(blocks)
 

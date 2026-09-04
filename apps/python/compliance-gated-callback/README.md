@@ -450,13 +450,13 @@ and `researchcall-survey` ([PR #145](https://github.com/CALLE-AI/awesome-phone-c
 A real call (`call_oUjPdPH-752n7uPzxDYZhg`) showed the agent end the
 call immediately after a bare "oui," with no recap of what was decided
 - cutting the recipient off mid-reply ("okay au..."). `build_hardened_task`
-now appends a sixth fixed block, `CALL_CLOSING_INSTRUCTIONS`, last
-(after the voicemail-handling block): it tells the agent to give a
-clear, brief recap of what was decided and what happens next before
-ending the call, and to never be the one to hang up first - it should
-wait for an explicit signal from the recipient ("goodbye," "that's
-all," "thank you") and keep the conversation open until then, rather
-than assume a short reply means the call is over.
+appends a fixed block, `CALL_CLOSING_INSTRUCTIONS`, LAST (after every
+other block described below): it tells the agent to give a clear,
+brief recap of what was decided and what happens next before ending
+the call, and to never be the one to hang up first - it should wait
+for an explicit signal from the recipient ("goodbye," "that's all,"
+"thank you") and keep the conversation open until then, rather than
+assume a short reply means the call is over.
 
 **Honest limit, same as voicemail handling**: this is a prompt-level
 instruction, not a control this app executes or can verify. CALL-E
@@ -466,6 +466,56 @@ line open itself. If the model doesn't follow the instruction, nothing
 here catches it; the only feedback available is reviewing the
 transcript afterward, exactly how this issue was found in the first
 place.
+
+**Don't add an arbitrary time limit to `--task`.** An operator-written
+phrase like "keep it under 90 seconds" directly conflicts with the
+instructions above: it pressures the model to cut the mandatory recap
+short, or hang up early, specifically to stay under a limit that has
+no real basis. Let the conversation run as long as it naturally needs
+to reach a proper close - none of this app's own fixed instructions
+impose a time limit, and `--task` examples in this README don't either.
+
+## Conversation flow
+
+Two more fixed blocks address behavior observed mid-call, in real
+calls, not just at the open or close:
+
+- `NO_REPEAT_OPENING_INSTRUCTIONS` - two real calls now
+  (`call_ErzDUKAIYUaBdnoRNhdNkw`, and the very first live call in this
+  project) showed the agent treat a short, unclear, or interrupting
+  reply as a cue to restart its opening (disclosure + reason for
+  calling) from scratch, instead of continuing the conversation.
+  `VOICEMAIL_HANDLING_INSTRUCTIONS` only ever addressed this for the
+  voicemail case specifically ("don't repeat the message multiple times
+  on a machine"); this generalizes the same rule to any live reply -
+  say the opening once, then never repeat it in full again, no matter
+  how brief or unclear the recipient's response is.
+- `PROACTIVE_NEXT_STEP_INSTRUCTIONS` - after answering a question, the
+  agent should actively suggest a concrete next step (an appointment, a
+  transfer, more information) instead of waiting passively for the next
+  question.
+
+Same honest limit as every other block here: these are instructions to
+the model, not controls this app enforces or can verify from outside.
+
+**A note on task size, since this keeps growing.** `build_hardened_task`
+is now up to eight distinct blocks. Measured directly: the six fixed
+instruction/label blocks alone are already roughly 3200 characters
+(~800 tokens) before any operator task, business context, or
+disclosure text is added - a realistic full task (disclosure +
+`business_context_example.txt`) runs close to 5000 characters (~1240
+tokens) of instructions the model has to track simultaneously during a
+live, real-time conversation. More competing instructions in one
+prompt is a known way to make a model less reliable at following any
+one of them precisely - and there's a real possibility this isn't just
+a risk in the abstract: a long, dense instruction block is exactly the
+kind of thing that could push a model to "replay the script from the
+top" as a recovery heuristic when it loses its place, which is the
+leading hypothesis for why the repetition bug above happens at all. Each
+block so far has been added in response to a concretely observed real
+call defect, and that bar should stay high: if instruction-following
+problems keep showing up as this list grows, the next fix should be
+consolidating or shortening these blocks, not appending another one.
 
 ## Web UI
 
