@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.10"
 
 [[package]]
-name = "calle-python-compliance-gated-callback"
+name = "calle-python-reality-resolver"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [

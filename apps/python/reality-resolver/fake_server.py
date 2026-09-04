@@ -20,6 +20,16 @@ components.schemas.APIError.code in calle.openapi.yaml):
   - recipient phone == "+10000000001"  -> 402 insufficient_balance
   - recipient phone == "+10000000002"  -> 429 rate_limit_exceeded, once,
                                            then succeeds on retry
+
+For Reality Resolver's patient_intent result_schema specifically (see
+verdict.patient_intent_result_schema), the completed structured_result
+is selected by recipient phone instead of always the happy path:
+  - recipient phone == "+10000000004"  -> patient_intent=cancelled,
+                                           answered_by=human
+  - recipient phone == "+10000000005"  -> patient_intent=unknown,
+                                           answered_by=voicemail
+  - any other phone                    -> patient_intent=confirmed,
+                                           answered_by=human
 """
 
 from __future__ import annotations
@@ -39,6 +49,13 @@ RECIPIENT_FIELDS = frozenset({"phones", "locale", "region"})
 
 INSUFFICIENT_BALANCE_PHONE = "+10000000001"
 RATE_LIMITED_ONCE_PHONE = "+10000000002"
+
+# Reserved phones selecting a canned patient_intent/answered_by pair for
+# Reality Resolver's result_schema (see verdict.patient_intent_result_schema),
+# same convention as the two constants above. Any other phone stays the
+# default confirmed/human happy path.
+PATIENT_CANCELLED_PHONE = "+10000000004"
+PATIENT_VOICEMAIL_PHONE = "+10000000005"
 
 READS_TO_IN_PROGRESS = 1
 READS_TO_COMPLETED = 2
@@ -78,14 +95,39 @@ class CallRecord:
         return stamp(self.created_at + timedelta(seconds=self.reads))
 
 
-def structured_result_for(result_schema: dict[str, Any] | None) -> dict[str, Any] | None:
+def _patient_intent_result_for(properties: dict[str, Any], phone: str | None) -> dict[str, Any]:
+    """Canned patient_intent/answered_by pair, selected by which of the
+    3 reserved phone numbers is on the request - same fault-injection
+    style as INSUFFICIENT_BALANCE_PHONE/RATE_LIMITED_ONCE_PHONE. Any
+    other phone is the default confirmed/human happy path.
+    """
+    if phone == PATIENT_CANCELLED_PHONE:
+        patient_intent, answered_by = "cancelled", "human"
+    elif phone == PATIENT_VOICEMAIL_PHONE:
+        patient_intent, answered_by = "unknown", "voicemail"
+    else:
+        patient_intent, answered_by = "confirmed", "human"
+
+    result: dict[str, Any] = {"patient_intent": patient_intent}
+    if "answered_by" in properties:
+        result["answered_by"] = answered_by
+    if "confidence_note" in properties:
+        result["confidence_note"] = (
+            "Fake server: deterministic canned result, not extracted from real call evidence."
+        )
+    if "manipulation_attempt_detected" in properties:
+        result["manipulation_attempt_detected"] = False
+    return result
+
+
+def structured_result_for(result_schema: dict[str, Any] | None, phone: str | None = None) -> dict[str, Any] | None:
     """Return a schema-plausible structured_result for this fake server.
 
     Real CALL-E extracts this from call evidence with a model. The fake
     server has no call evidence, so it returns a fixed value taken from the
-    schema's own enums when the shape matches this app's intent schema, and
-    None otherwise (matching the documented "null when no result_schema was
-    provided or extraction failed" behavior). Fills next_action,
+    schema's own enums when the shape matches a schema this app knows about,
+    and None otherwise (matching the documented "null when no result_schema
+    was provided or extraction failed" behavior). Fills next_action,
     confidence_note, and manipulation_attempt_detected too, when the
     schema declares them, so the fake server exercises the full result
     shape end to end.
@@ -93,6 +135,10 @@ def structured_result_for(result_schema: dict[str, Any] | None) -> dict[str, Any
     if not result_schema:
         return None
     properties = result_schema.get("properties", {})
+
+    if "patient_intent" in properties:
+        return _patient_intent_result_for(properties, phone)
+
     intent_property = properties.get("intent")
     if not (isinstance(intent_property, dict) and "enum" in intent_property):
         return None
@@ -173,8 +219,9 @@ class FakeCalle:
         payload = record.payload
         settled = record.settled
         result_schema = payload.get("result_schema")
-        structured_result = structured_result_for(result_schema) if settled else None
         recipients_in = payload.get("recipients") or []
+        first_phone = (recipients_in[0].get("phones") or [None])[0] if recipients_in else None
+        structured_result = structured_result_for(result_schema, first_phone) if settled else None
 
         recipients_out = []
         for index, recipient_in in enumerate(recipients_in):

@@ -1,7 +1,7 @@
 [project]
-name = "calle-python-compliance-gated-callback"
+name = "calle-python-reality-resolver"
 version = "0.0.0"
-description = "Fail-closed, per-jurisdiction compliance gate for CALL-E outbound callback agents."
+description = "Evidence-driven decision engine for CALL-E: only escalates to a compliance-gated outbound call when a decision is genuinely uncertain."
 requires-python = ">=3.10"
 dependencies = [
   # zoneinfo (used by compliance/time_utils.py for calling-window checks)
