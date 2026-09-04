@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: compliance-gated-callback-demo
+    name: reality-resolver-demo
     runtime: python
     plan: free
     buildCommand: "pip install tzdata"

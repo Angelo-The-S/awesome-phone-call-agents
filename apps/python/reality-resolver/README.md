@@ -1,7 +1,227 @@
-# compliance-gated-callback
+# reality-resolver
 
-Fail-closed, per-jurisdiction compliance gate for CALL-E outbound
-callback agents.
+An evidence-driven decision engine for CALL-E: before ever placing an
+outbound call, it asks whether the call is actually needed. A
+structured record (a calendar entry, a database field) can be qualified
+or contradicted by a human account (an email, a note) that never gets
+reconciled - a state nobody has actually confirmed. Reality Resolver
+detects exactly that situation, and only then escalates to a real,
+compliance-gated CALL-E call to resolve it - never for evidence that
+already speaks for itself, and never treating an unresolved outcome as
+if it were a cancellation.
+
+This app evolved from an earlier, independent submission on this same
+repository and PR (`compliance-gated-callback`; see "Reused compliance
+layer" below): the legal/compliance gate and the CALL-E task-hardening
+it built are reused here unmodified, as one gate among several in this
+larger decision engine.
+
+## Decision engine
+
+```
+Evidence sources (fixtures JSON)
+  -> Evidence Matrix
+  -> 4 generic rules (R1-R4)
+  -> decision-critical uncertainty?
+       NO  -> NO_CALL_NEEDED
+       YES -> call justified -> call permitted? (compliance gate, reused as-is)
+                NO  -> UNRESOLVED_CALL_BLOCKED, RETRY_WHEN_PERMITTED
+                YES -> CALL-E (client.py, reused as-is)
+                       -> structured_result -> reconciliation
+                       -> RESOLVED / RESOLVED_ALT / UNRESOLVED_AMBIGUOUS
+```
+
+Two branches never reach the compliance gate or CALL-E at all:
+`NO_CALL_NEEDED` (the evidence is not actually in decision-critical
+contradiction - see "The four rules" below) and
+`UNRESOLVED_CALL_BLOCKED` (the call would be justified, but the
+compliance gate - reused unmodified from `compliance-gated-callback` -
+blocks it; see `next_window.py` for the honest limits of the "next
+legal window" projection this shows).
+
+**`UNRESOLVED_CALL_BLOCKED` vs. `UNRESOLVED_AMBIGUOUS` - not the same
+thing.** `UNRESOLVED_CALL_BLOCKED` means no call was placed at all: the
+uncertainty was decision-critical, but the compliance gate refused
+(missing consent, wrong hour, and so on) - the recipient never heard
+the phone ring. `UNRESOLVED_AMBIGUOUS` means a call *was* placed and
+answered, but CALL-E's own result did not cleanly confirm or cancel
+(voicemail, an IVR, or a genuinely uncertain answer) - see
+"Reconciliation and verdicts" below.
+
+## The Ghost Appointment scenario
+
+`cases/ghost-appointment.json` is the shipped example: a dental
+practice's calendar says a patient's appointment is confirmed for
+14:00 tomorrow (`type: structured`, low ambiguity). A separate email
+from the patient says "I may need to cancel" (`type: human`, high
+ambiguity). A scheduled follow-up never got a reply (`type: absence`).
+Nobody has actually reconciled these two accounts - the slot might be
+kept, or it might be sitting on the calendar unused while another
+patient could have taken it. That is a decision-critical contradiction
+by construction (see "The four rules" below: R1 and R2 both come from
+this same tension, R3 confirms nothing since resolved it, and R4
+depends on how close the appointment deadline is) - not because the
+scenario is contrived to make the rules fire, but because a ghost
+appointment like this is exactly the kind of ambiguity a business would
+actually want a callback to resolve before deciding `KEEP_SLOT` or
+`RELEASE_SLOT`.
+
+## Evidence model
+
+`evidence/model.py` defines:
+
+- `Evidence(source, type, freshness, claim, ambiguity)` - one fact or
+  account. `type` is `structured` (a system of record), `human` (a
+  free-text account), or `absence` (the fact that something expected
+  never arrived). `freshness` is how long ago it was captured.
+  `ambiguity` (`low`/`medium`/`high`) is the evidence author's own
+  confidence, not used by every rule (see R2 below).
+- `EvidenceMatrix` - all the evidence for one case.
+- `Case` - one decision-critical question: its `EvidenceMatrix`, an
+  absolute UTC `deadline`, a `decision_deadline_threshold` (how close
+  counts as "close" - case data, not an engine default; see R4 below),
+  `decision_options` (the two domain-specific action labels,
+  `if_confirmed`/`if_cancelled`), `call_phone`, and `call_task_hint`
+  (seeds the operator-task text handed to `build_hardened_task`,
+  unmodified).
+
+Cases are loaded from JSON - see `cases/ghost-appointment.json`. Fields
+map directly: `freshness_hours`, `decision_deadline_threshold_hours`,
+and `deadline` (ISO 8601 UTC) are plain numbers/strings, not relative
+phrases - "tomorrow 14:00" is not machine-meaningful without a fixed
+reference point, so a real case should pin a concrete date. The shipped
+fixture's deadline will need bumping as time passes; use `--now-utc` to
+pin a consistent "now" close to it for a reliable demo run (see
+"Running the demo" below). `--now-utc` is a single value shared by R4's
+deadline check *and* the compliance gate's calling-window check further
+down the pipeline (`resolver.py` passes the same `now` to both) - there
+is no separate "pretend it's daytime" flag; picking a realistic instant
+covers both at once.
+
+## The four rules
+
+`evidence/rules.py` defines four independent, generic rules, each
+returning a boolean plus a plain-text explanation - the same shape as
+`compliance/models.py`'s `CheckResult`. All four true means the
+uncertainty is decision-critical (`evidence/engine.py`).
+
+| Rule | Question | Heuristic |
+|---|---|---|
+| R1 `StructuredStateRule` | Does a structured source assert a state? | Any `Evidence` with `type == structured` |
+| R2 `HumanQualificationRule` | Does a human source diverge from it? | A small polarity lexicon classifies each claim as `confirming` or `diverging`; true when a human claim's polarity is classified and differs from the structured claim's |
+| R3 `UnresolvedEvidenceRule` | Has nothing since resolved the divergence? | True when no evidence is both fresher than the diverging human evidence and itself low-ambiguity |
+| R4 `DecisionDeadlineRule` | Is the deadline close? | `deadline - now <= Case.decision_deadline_threshold` - case data, never an engine constant |
+
+**Honest limits.** None of this is real natural-language understanding.
+R2/R3's polarity lexicon (`_CONFIRMING_MARKERS`/`_DIVERGING_MARKERS` in
+`evidence/rules.py`) is a small, literal, auditable set of markers - the
+same kind of honest, documented heuristic as
+`compliance/jurisdictions/eu_common.py`'s literal `"artificial
+intelligence"` substring check. It compares claim *content* (not just
+the evidence author's own `ambiguity` label) specifically so that a
+confidently-stated contradiction ("I already cancelled") is still
+caught, and a claim with no recognized marker is deliberately left
+unclassified rather than guessed - which means R2 fails toward *not*
+escalating to a call, the safe direction given the absolute rule below.
+It can still be misled by an irrelevant claim that happens to contain a
+lexicon marker; real subject-matching would need real language
+understanding, which this rule does not have. "Same state/subject" is
+otherwise assumed structurally: every `Evidence` inside one `Case` is,
+by that case's own construction, evidence about the one state it is
+resolving.
+
+## Reconciliation and verdicts
+
+Once a call is justified and permitted, `verdict.py` reconciles CALL-E's
+`structured_result` (using `patient_intent_result_schema()`, adapted
+from `client.py`'s own `default_intent_result_schema()`, which is
+untouched) into a final verdict:
+
+| `patient_intent` | `answered_by` | Status | Action |
+|---|---|---|---|
+| `confirmed` | `human` | `RESOLVED` | `Case.decision_options["if_confirmed"]` |
+| `cancelled` | `human` | `RESOLVED_ALT` | `Case.decision_options["if_cancelled"]` |
+| anything else (`uncertain`, `unknown`, `voicemail`, `ivr`, or no result) | - | `UNRESOLVED_AMBIGUOUS` | `HUMAN_REVIEW` |
+
+**Absolute rule: unresolved evidence is never treated as cancelled.**
+Every combination other than the exact `(confirmed, human)` and
+`(cancelled, human)` matches falls back to `HUMAN_REVIEW` - checked as
+an invariant over all 25 `(patient_intent, answered_by)` combinations in
+`tests/test_verdict.py`, not left as a convention.
+
+The two paths before CALL-E is ever reached use their own fixed,
+generic actions, not case data, since any case of any domain resolves
+to one of these when it never reaches a call or the call doesn't
+resolve anything: `NO_CALL_NEEDED` -> `NO_ACTION_REQUIRED`;
+`UNRESOLVED_CALL_BLOCKED` -> `RETRY_WHEN_PERMITTED`.
+
+## CLI output
+
+`resolver.py case.json` prints five sections, in order:
+
+- `EVIDENCE STATE` - every evidence item (source, type, freshness,
+  ambiguity, claim).
+- `REASONING` - R1-R4, each `YES`/`NO` with its explanation.
+- `CALL JUSTIFICATION` - whether the uncertainty is decision-critical.
+- `CALL PERMISSION` - only if a call is justified; the compliance
+  gate's own output (`client.py`'s `print_compliance_decision`, reused
+  unmodified), plus the next legal window if blocked (`next_window.py` -
+  only computed when every blocking reason is a calling-window check;
+  consent/DNC/disclosure/revocation/solicitation-cap blocks say plainly
+  that there is no next window to wait for).
+- `CALL-E` - only if permitted; the request body preview, and (with
+  `--execute`) the created call and final result.
+- `VERDICT` - status, action, and the evidence cited (the original case
+  evidence plus, when a call was placed, CALL-E's own result).
+
+## Running the demo
+
+Against the fake server, three reserved phone numbers select which of
+the three CALL-E branches to simulate (see `fake_server.py`):
+
+| Phone | `patient_intent` | `answered_by` | Verdict |
+|---|---|---|---|
+| any other phone (default) | `confirmed` | `human` | `RESOLVED` |
+| `+10000000004` | `cancelled` | `human` | `RESOLVED_ALT` |
+| `+10000000005` | `unknown` | `voicemail` | `UNRESOLVED_AMBIGUOUS` |
+
+Start a fake server in one terminal (it prints `{"base_url": "..."}`
+and then blocks, serving requests until Ctrl+C):
+
+```bash
+uv run python fake_server.py
+```
+
+then, against that `base_url`, in another terminal:
+
+```bash
+uv run python resolver.py cases/ghost-appointment.json \
+  --base-url http://127.0.0.1:PORT --execute \
+  --now-utc 2026-09-10T20:00:00Z --recipient-timezone America/New_York \
+  --consent-obtained --consent-timestamp 2026-08-20T12:00:00Z --dnc-checked
+```
+
+Add `--phone +10000000004` or `--phone +10000000005` to see the
+`RESOLVED_ALT`/`UNRESOLVED_AMBIGUOUS` branches instead. Drop
+`--now-utc` far from the case's deadline (or omit the compliance flags)
+to see `NO_CALL_NEEDED`/`UNRESOLVED_CALL_BLOCKED` instead - neither
+needs a fake server at all, since neither ever reaches CALL-E.
+
+The shipped `cases/ghost-appointment.json` uses a reserved, non-routable
+NANP placeholder number (`+12025550123`) - never a real one. Pass
+`--phone` to override it for a real call; do not edit or commit a real
+number into a case file.
+
+## Reused compliance layer
+
+> The compliance and disclosure logic below (`compliance/`, and the
+> disclosure-script, injection-resistance, voicemail,
+> no-repeat-opening, proactive-next-step, and call-closing instruction
+> blocks in `client.py`) originated as an earlier, independent
+> submission on this same repository and PR (originally
+> `compliance-gated-callback`). It is reused here unmodified, as one
+> gate among several in this larger decision engine - not rewritten,
+> not re-claimed as new work for this round.
 
 ## The problem
 
@@ -561,8 +781,8 @@ the above, but there is no reason for a real credential to exist in a
 public demo's configuration at all.
 
 To deploy on Render: create a new Web Service from your fork, set
-**Root Directory** to `apps/python/compliance-gated-callback`, and
-Render picks up `render.yaml` automatically (free plan, Python runtime).
+**Root Directory** to `apps/python/reality-resolver`, and Render picks
+up `render.yaml` automatically (free plan, Python runtime).
 
 Two free-tier trade-offs worth knowing: there is no rate limiting on the
 form (acceptable here since nothing reachable has a real-world cost or a
