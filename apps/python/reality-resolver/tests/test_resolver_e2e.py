@@ -1,7 +1,7 @@
 """End-to-end tests for resolver.py against fake_server.py only.
 
-Same subprocess-driven pattern as test_e2e.py's _run_cli - no test here
-ever targets api.heycall-e.com. Covers all 5 verdict branches: two that
+Subprocess-driven: no test here ever targets api.heycall-e.com. Covers
+all 5 verdict branches: two that
 never reach CALL-E at all (NO_CALL_NEEDED, UNRESOLVED_CALL_BLOCKED) and
 three that do (RESOLVED, RESOLVED_ALT, UNRESOLVED_AMBIGUOUS), selected
 via fake_server.py's reserved phone numbers.
@@ -59,22 +59,46 @@ def test_far_from_deadline_is_no_call_needed_and_never_reaches_compliance_or_cal
         assert server.creates == 0
 
 
-def test_near_deadline_without_consent_is_blocked_with_a_next_window() -> None:
-    """--mode live is required here: this test exercises the fully
-    enforced/fail-closed path (see tests/test_resolver_mode.py for the
-    default demo-mode behavior, which does not stop on this same input).
+def test_near_deadline_with_no_commercial_compliance_flags_still_reaches_calle() -> None:
+    """The shipped case's use_case is appointment_confirmation: calling-
+    window, consent, DNC-scrub, and solicitation-cap checks (all scoped
+    to commercial solicitation in their source statutes) are exempted
+    for this use case, so a real call proceeds even with none of the
+    commercial compliance flags supplied at all - not because compliance
+    is bypassed, but because those specific rules do not apply to this
+    use case. Disclosure and revocation, which do stay applicable, both
+    pass trivially here (a static disclosure script, no revocation
+    requested) - see test_unmapped_jurisdiction_still_blocks below for
+    proof the hard gate still has teeth for a check that does apply.
+    """
+    with FakeCalleServer() as server:
+        result = _run_resolver(server.base_url, ["--now-utc", NEAR_DEADLINE_NOW, "--execute"])
+
+        assert result.returncode == 0, result.stderr
+        assert "[FAIL] us_federal_calling_window" in result.stdout or "[FAIL] us_federal_consent" in result.stdout
+        assert "Not applicable to use case 'appointment_confirmation'" in result.stdout
+        assert "Compliance gate (applicable to 'appointment_confirmation'): allowed=True" in result.stdout
+        assert "Status: RESOLVED" in result.stdout
+        assert "Action: KEEP_SLOT" in result.stdout
+        assert server.creates == 1
+
+
+def test_unmapped_jurisdiction_still_blocks_regardless_of_use_case() -> None:
+    """jurisdiction_resolved is never exempted for any use case - an
+    unmapped phone number still hard-blocks, proving the use-case filter
+    narrows which rules apply but never turns the gate off entirely.
     """
     with FakeCalleServer() as server:
         result = _run_resolver(
             server.base_url,
-            ["--mode", "live", "--now-utc", NEAR_DEADLINE_NOW, "--recipient-timezone", "America/New_York"],
+            ["--phone", "+442079460123", "--now-utc", NEAR_DEADLINE_NOW],
         )
 
         assert result.returncode == 0, result.stderr
         assert "R1-R4 all triggered" in result.stdout
         assert "Status: UNRESOLVED_CALL_BLOCKED" in result.stdout
         assert "Action: RETRY_WHEN_PERMITTED" in result.stdout
-        assert "non-time-based reason" in result.stdout  # consent/DNC are not time-based
+        assert "no jurisdiction mapped" in result.stdout
         assert server.creates == 0
 
 

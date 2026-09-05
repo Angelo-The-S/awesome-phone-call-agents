@@ -1,9 +1,7 @@
 """Reconciliation from CALL-E's structured_result to a case verdict.
 
 Also defines patient_intent_result_schema(), the result_schema sent to
-CALL-E for a Reality Resolver call - adapted from client.py's own
-default_intent_result_schema(), which is untouched and still used
-wherever the original compliance-gated-callback CLI flow runs.
+CALL-E for a Reality Resolver call.
 """
 
 from __future__ import annotations

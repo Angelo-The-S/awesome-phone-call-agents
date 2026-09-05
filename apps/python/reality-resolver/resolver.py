@@ -45,6 +45,7 @@ from client import (
 )
 from compliance.dispatcher import resolve_locale_and_region, run_precall_checks
 from compliance.models import PreCallContext, PreCallDecision
+from compliance.use_cases import UnknownUseCaseError, apply_use_case
 from evidence.engine import ReasoningResult, evaluate
 from evidence.model import Case, load_case
 from next_window import next_legal_window
@@ -99,29 +100,10 @@ def print_verdict(verdict: Verdict) -> None:
         print(f"    - {item}", flush=True)
 
 
-def print_mode_banner(mode: str) -> None:
-    """Deliberately hard to miss: in demo mode, a live-policy violation
-    is only ever a warning, never a block - including for a real
-    CALL-E call if --execute --allow-live are also passed. See
-    README.md's "Demo mode vs. live mode" section for the full
-    explanation.
-    """
-    bar = "=" * 64
-    print(bar, flush=True)
-    if mode == "live":
-        print(" MODE: LIVE - compliance is fully enforced. Fail-closed.", flush=True)
-    else:
-        print(" MODE: DEMO - compliance is evaluated and displayed, but NOT", flush=True)
-        print(" enforced - not even for a real CALL-E call. A live-policy", flush=True)
-        print(" violation becomes a warning, never a block. Use --mode live", flush=True)
-        print(" for enforced, fail-closed behavior.", flush=True)
-    print(bar, flush=True)
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reality Resolver: an evidence-driven decision engine with a "
-        "compliance-gated CALL-E escalation, built on compliance-gated-callback."
+        description="Reality Resolver: resolves a decision-critical uncertainty by escalating "
+        "to a compliance-gated CALL-E call only when the case's own evidence cannot decide it."
     )
     parser.add_argument("case", help="Path to a case JSON file, e.g. cases/ghost-appointment.json.")
     parser.add_argument(
@@ -130,17 +112,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override the case file's call_phone (E.164). The shipped example cases use a "
         "reserved, non-routable placeholder number - pass a real number here rather than "
         "editing or committing one into a case file.",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["demo", "live"],
-        default="demo",
-        help="demo (default): the compliance gate is always evaluated and displayed honestly, "
-        "but a failing result never stops the call - not even a real CALL-E call if --execute "
-        "--allow-live are also passed. A live-policy violation becomes a warning, never a "
-        "block; safe for local testing and for judges cloning this repo at any hour. live: the "
-        "compliance gate is fully enforced, fail-closed, identical to the original "
-        "compliance-gated-callback behavior.",
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument(
@@ -154,10 +125,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--allow-live",
         action="store_true",
         help=f"Required in addition to --base-url {REAL_API_BASE_URL} and --execute before any "
-        "real call can be placed, in either mode - --allow-live only means 'a real call to "
-        "CALL-E is explicitly authorized', independent of whether the compliance policy is "
-        "enforced (--mode live) or displayed-but-not-enforced (--mode demo). Refused together "
-        "with --now-utc - a real call always sees the real current time.",
+        "real call can be placed. Means only 'a real call to CALL-E is explicitly "
+        "authorized' - the compliance gate itself is always fully enforced, fail-closed, "
+        "regardless of this flag. Refused together with --now-utc - a real call always sees "
+        "the real current time.",
     )
     parser.add_argument(
         "--now-utc",
@@ -165,8 +136,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override 'now' for both rule evaluation (R4's deadline check, calling-window "
         "checks) and the next-legal-window projection, ISO 8601 UTC. Development/testing "
-        "determinism only - refused together with --allow-live, in either mode; production "
-        "usage omits this.",
+        "determinism only - refused together with --allow-live; production usage omits this.",
     )
     parser.add_argument("--poll-interval-seconds", type=float, default=2.0)
     parser.add_argument("--poll-timeout-seconds", type=float, default=None)
@@ -191,13 +161,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     # Safety interlock, checked before anything else is loaded or run: a
-    # real call must always see the real current time, in either mode.
-    # --allow-live only ever means "a real call to CALL-E is explicitly
-    # authorized" - independent of whether the compliance policy is
-    # enforced (--mode live) or displayed-but-not-enforced (--mode demo,
-    # the default). --execute is still required as a second, separate
-    # confirmation before anything is ever sent (see the dry-run check
-    # further down, unchanged).
+    # real call must always see the real current time. --allow-live only
+    # ever means "a real call to CALL-E is explicitly authorized" -
+    # --execute is still required as a second, separate confirmation
+    # before anything is ever sent (see the dry-run check further down,
+    # unchanged).
     if args.allow_live and args.now_utc is not None:
         print(
             "error: --now-utc cannot be combined with --allow-live. A real call must always be "
@@ -213,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Case: {case.name}", flush=True)
     print(f"Mode: {'EXECUTE' if args.execute else 'DRY-RUN'}", flush=True)
-    print_mode_banner(args.mode)
+    print(f"Use case: {case.use_case}", flush=True)
     print_evidence_state(case)
 
     reasoning = evaluate(case.evidence, case.deadline, now, case.decision_deadline_threshold)
@@ -240,16 +208,31 @@ def main(argv: list[str] | None = None) -> int:
     decision: PreCallDecision = run_precall_checks(context)
     print("=== CALL PERMISSION ===", flush=True)
     print_compliance_decision(decision)
-    would_block_in_live = not decision.allowed
-    print(f"would_block_in_live: {would_block_in_live}", flush=True)
-    mode_citation = f"mode={args.mode}, would_block_in_live={would_block_in_live}"
 
-    if args.mode == "live" and not decision.allowed:
-        # Fully enforced, fail-closed - identical to the original
-        # compliance-gated-callback behavior. Only reachable in --mode
-        # live; in --mode demo (default) a failing decision never stops
-        # the call - see the would_block_in_live branch below instead.
-        window = next_legal_window(decision, args.recipient_timezone, now)
+    try:
+        applicable_decision = apply_use_case(decision, case.use_case)
+    except UnknownUseCaseError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    exempted_checks = tuple(
+        result.check_name for result in decision.results if result not in applicable_decision.results
+    )
+    if exempted_checks:
+        print(
+            f"  Not applicable to use case {case.use_case!r} (commercial-solicitation-specific): "
+            f"{', '.join(exempted_checks)}",
+            flush=True,
+        )
+    print(f"Compliance gate (applicable to {case.use_case!r}): allowed={applicable_decision.allowed}", flush=True)
+    use_case_citation = f"use_case={case.use_case}"
+
+    if not applicable_decision.allowed:
+        # Fully enforced, fail-closed - the hard gate always applies, for
+        # every case and every target, real or fake. There is no mode
+        # that bypasses or merely warns about a failing check still
+        # applicable to this use case.
+        window = next_legal_window(applicable_decision, args.recipient_timezone, now)
         print(f"  Next legal window: {window}", flush=True)
         print_verdict(
             Verdict(
@@ -257,26 +240,13 @@ def main(argv: list[str] | None = None) -> int:
                 ACTION_RETRY_WHEN_PERMITTED,
                 citations
                 + (
-                    f"compliance gate blocked: {decision.blocking_reasons}",
+                    f"compliance gate blocked: {applicable_decision.blocking_reasons}",
                     f"next legal window: {window}",
-                    mode_citation,
+                    use_case_citation,
                 ),
             )
         )
         return 0
-
-    if args.mode == "demo" and would_block_in_live:
-        real_call_note = (
-            " A REAL CALL-E call is about to be placed despite this." if args.allow_live else ""
-        )
-        print(
-            "*** DEMO MODE: this call would be BLOCKED in live mode ***\n"
-            f"    reasons: {decision.blocking_reasons}\n"
-            f"    Proceeding anyway because --mode demo.{real_call_note} Live policy "
-            "violations are warnings only in this mode, not blocks. Use --mode live for "
-            "enforced, fail-closed behavior.",
-            flush=True,
-        )
 
     locale, region, disclosure_script_template = resolve_locale_and_region(decision.jurisdiction_chain)
     disclosure_script = (
@@ -284,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         if disclosure_script_template
         else None
     )
-    hardened_task = build_hardened_task(case.call_task_hint, business_context=None, disclosure_script=disclosure_script)
+    hardened_task = build_hardened_task(case.call_task_hint, disclosure_script=disclosure_script)
     recipient = build_recipient(case.call_phone, locale, region)
     result_schema = patient_intent_result_schema()
 
@@ -360,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
 
     structured_result = final_call.get("structured_result")
     verdict = reconcile(structured_result, case.decision_options, case.evidence)
-    verdict = replace(verdict, evidence_cited=verdict.evidence_cited + (mode_citation,))
+    verdict = replace(verdict, evidence_cited=verdict.evidence_cited + (use_case_citation,))
     print_verdict(verdict)
     return 0
 

@@ -6,11 +6,11 @@ lifecycle only (no MCP surface), matching this app's client.py.
 
 Simulates the queued -> in_progress -> completed lifecycle and returns a
 structured_result shaped by the CreateCallRequest.result_schema field of the
-create request, so client.py can be proven end to end without ever
-reaching api.heycall-e.com. This is the default and only target for
-test_e2e.py; a real call requires the client's --allow-live flag plus the
-compliance gate allowing it (see compliance/), neither of which this fake
-server participates in.
+create request, so client.py/resolver.py can be proven end to end without
+ever reaching api.heycall-e.com. This is the default and only target for
+this app's test suite; a real call requires the client's --allow-live flag
+plus the compliance gate allowing it (see compliance/), neither of which
+this fake server participates in.
 
 Fault injection (used to exercise the client's error handling, matching
 components.schemas.APIError.code in calle.openapi.yaml):
@@ -18,8 +18,16 @@ components.schemas.APIError.code in calle.openapi.yaml):
   - recipient region == "ZZ"           -> 400 unsupported_region
   - recipient locale == "zz-ZZ"        -> 400 unsupported_language
   - recipient phone == "+10000000001"  -> 402 insufficient_balance
-  - recipient phone == "+10000000002"  -> 429 rate_limit_exceeded, once,
-                                           then succeeds on retry
+  - recipient phone == "+10000000002"  -> 429 rate_limit_exceeded on the
+                                           first request with a given
+                                           Idempotency-Key, 2xx if that
+                                           same key is sent again. This
+                                           app's own client never retries
+                                           POST automatically (see
+                                           client.py) and so always sees
+                                           the 429 - this fault injection
+                                           exists to prove that, not to
+                                           imply a retry happens.
 
 For Reality Resolver's patient_intent result_schema specifically (see
 verdict.patient_intent_result_schema), the completed structured_result
@@ -124,13 +132,10 @@ def structured_result_for(result_schema: dict[str, Any] | None, phone: str | Non
     """Return a schema-plausible structured_result for this fake server.
 
     Real CALL-E extracts this from call evidence with a model. The fake
-    server has no call evidence, so it returns a fixed value taken from the
-    schema's own enums when the shape matches a schema this app knows about,
-    and None otherwise (matching the documented "null when no result_schema
-    was provided or extraction failed" behavior). Fills next_action,
-    confidence_note, and manipulation_attempt_detected too, when the
-    schema declares them, so the fake server exercises the full result
-    shape end to end.
+    server has no call evidence, so it returns a fixed, canned value when
+    the schema is Reality Resolver's own patient_intent_result_schema,
+    and None otherwise (matching the documented "null when no
+    result_schema was provided or extraction failed" behavior).
     """
     if not result_schema:
         return None
@@ -139,37 +144,7 @@ def structured_result_for(result_schema: dict[str, Any] | None, phone: str | Non
     if "patient_intent" in properties:
         return _patient_intent_result_for(properties, phone)
 
-    intent_property = properties.get("intent")
-    if not (isinstance(intent_property, dict) and "enum" in intent_property):
-        return None
-
-    enum_values = intent_property["enum"]
-    result: dict[str, Any] = {"intent": "appointment" if "appointment" in enum_values else enum_values[0]}
-
-    next_action_property = properties.get("next_action")
-    if isinstance(next_action_property, dict) and "enum" in next_action_property:
-        next_action_values = next_action_property["enum"]
-        result["next_action"] = (
-            "schedule_callback" if "schedule_callback" in next_action_values else next_action_values[0]
-        )
-
-    if "confidence_note" in properties:
-        result["confidence_note"] = (
-            "Fake server: deterministic canned result, not extracted from real call evidence."
-        )
-
-    if "manipulation_attempt_detected" in properties:
-        # The fake server has no real call evidence of an attack, so it
-        # always reports none.
-        result["manipulation_attempt_detected"] = False
-
-    if "answered_by" in properties:
-        # Fake server has no real call evidence; always simulates the
-        # happy path (reached a human), consistent with its canned
-        # "Hello from the fake server." / "Understood, goodbye." transcript.
-        result["answered_by"] = "human"
-
-    return result
+    return None
 
 
 class FakeCalle:

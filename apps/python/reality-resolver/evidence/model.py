@@ -66,6 +66,7 @@ class Case:
     decision_options: dict[str, str]  # e.g. {"if_confirmed": "KEEP_SLOT", "if_cancelled": "RELEASE_SLOT"} - the unresolved/blocked/no-call actions are fixed engine constants (verdict.ACTION_*), not case data
     call_phone: str
     call_task_hint: str
+    use_case: str  # e.g. "appointment_confirmation" - which generic compliance rules apply; see compliance/use_cases.py
 
 
 def load_case(path: str | Path) -> Case:
@@ -88,4 +89,5 @@ def load_case(path: str | Path) -> Case:
         decision_options=data["decision_options"],
         call_phone=data["call_phone"],
         call_task_hint=data["call_task_hint"],
+        use_case=data["use_case"],
     )

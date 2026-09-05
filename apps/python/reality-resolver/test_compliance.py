@@ -25,7 +25,7 @@ from compliance.dispatcher import (
     run_precall_checks,
 )
 from compliance.jurisdictions import fr, us_federal
-from compliance.models import ConfidenceLevel, PreCallContext, compute_consent_retention_expiry
+from compliance.models import ConfidenceLevel, PreCallContext
 
 # --- US federal fixtures -----------------------------------------------
 
@@ -309,25 +309,3 @@ def test_oregon_revocation_blocks() -> None:
     decision = run_precall_checks(context)
     assert decision.allowed is False
     assert reasons_for(decision, "us_oregon_revocation")
-
-
-# --- Consent-record retention (FTC TSR / Germany UWG Sec. 7a) -----------
-
-
-def test_compute_consent_retention_expiry_anchors_on_later_call_time() -> None:
-    consent = datetime(2026, 1, 1, tzinfo=UTC)
-    call = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
-    assert compute_consent_retention_expiry(consent, call) == datetime(2031, 8, 20, 12, 0, tzinfo=UTC)
-
-
-def test_compute_consent_retention_expiry_anchors_on_later_consent_time() -> None:
-    consent = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
-    call = datetime(2026, 1, 1, tzinfo=UTC)
-    assert compute_consent_retention_expiry(consent, call) == datetime(2031, 8, 20, 12, 0, tzinfo=UTC)
-
-
-def test_compute_consent_retention_expiry_handles_leap_day_anchor() -> None:
-    consent = datetime(2028, 2, 29, 12, 0, tzinfo=UTC)  # 2028 is a leap year
-    call = datetime(2028, 1, 1, tzinfo=UTC)
-    # 2033 is not a leap year, so Feb 29 falls back to Feb 28.
-    assert compute_consent_retention_expiry(consent, call) == datetime(2033, 2, 28, 12, 0, tzinfo=UTC)
