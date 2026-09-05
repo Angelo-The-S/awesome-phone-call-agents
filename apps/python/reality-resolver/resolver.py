@@ -100,18 +100,21 @@ def print_verdict(verdict: Verdict) -> None:
 
 
 def print_mode_banner(mode: str) -> None:
-    """Deliberately hard to miss: the demo/live distinction changes
-    whether a failing compliance gate actually stops the call, so it
-    must never be confused with a quiet default. See README.md's "Demo
-    mode vs. live mode" section for the full explanation.
+    """Deliberately hard to miss: in demo mode, a live-policy violation
+    is only ever a warning, never a block - including for a real
+    CALL-E call if --execute --allow-live are also passed. See
+    README.md's "Demo mode vs. live mode" section for the full
+    explanation.
     """
     bar = "=" * 64
     print(bar, flush=True)
     if mode == "live":
         print(" MODE: LIVE - compliance is fully enforced. Fail-closed.", flush=True)
     else:
-        print(" MODE: DEMO - compliance evaluated and displayed, not enforced.", flush=True)
-        print(" No real call is reachable in this mode.", flush=True)
+        print(" MODE: DEMO - compliance is evaluated and displayed, but NOT", flush=True)
+        print(" enforced - not even for a real CALL-E call. A live-policy", flush=True)
+        print(" violation becomes a warning, never a block. Use --mode live", flush=True)
+        print(" for enforced, fail-closed behavior.", flush=True)
     print(bar, flush=True)
 
 
@@ -133,10 +136,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["demo", "live"],
         default="demo",
         help="demo (default): the compliance gate is always evaluated and displayed honestly, "
-        "but a failing result never stops the call - safe for local testing and for judges "
-        "cloning this repo at any hour, since --allow-live requires --mode live (see below), "
-        "so no real call is reachable while in demo mode. live: the compliance gate is fully "
-        "enforced, fail-closed, identical to the original compliance-gated-callback behavior.",
+        "but a failing result never stops the call - not even a real CALL-E call if --execute "
+        "--allow-live are also passed. A live-policy violation becomes a warning, never a "
+        "block; safe for local testing and for judges cloning this repo at any hour. live: the "
+        "compliance gate is fully enforced, fail-closed, identical to the original "
+        "compliance-gated-callback behavior.",
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument(
@@ -149,10 +153,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--allow-live",
         action="store_true",
-        help=f"Required in addition to --base-url {REAL_API_BASE_URL} before any real call can "
-        "be placed. Also requires --mode live, and is refused together with --now-utc - a real "
-        "call is always evaluated against the real current time, in fully-enforced mode, never "
-        "an overridden one.",
+        help=f"Required in addition to --base-url {REAL_API_BASE_URL} and --execute before any "
+        "real call can be placed, in either mode - --allow-live only means 'a real call to "
+        "CALL-E is explicitly authorized', independent of whether the compliance policy is "
+        "enforced (--mode live) or displayed-but-not-enforced (--mode demo). Refused together "
+        "with --now-utc - a real call always sees the real current time.",
     )
     parser.add_argument(
         "--now-utc",
@@ -160,7 +165,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override 'now' for both rule evaluation (R4's deadline check, calling-window "
         "checks) and the next-legal-window projection, ISO 8601 UTC. Development/testing "
-        "determinism only - refused together with --allow-live; production usage omits this.",
+        "determinism only - refused together with --allow-live, in either mode; production "
+        "usage omits this.",
     )
     parser.add_argument("--poll-interval-seconds", type=float, default=2.0)
     parser.add_argument("--poll-timeout-seconds", type=float, default=None)
@@ -184,17 +190,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    # Safety interlocks, checked before anything else is loaded or run:
-    # demo mode must never be reachable at the same time as real API
-    # access, and a real call must always see the real current time.
-    if args.allow_live and args.mode != "live":
-        print(
-            "error: --allow-live requires --mode live (got --mode demo). Demo mode never "
-            "enforces the live compliance policy and must never be combined with real API "
-            "access. Pass --mode live explicitly to place a real call.",
-            file=sys.stderr,
-        )
-        return 1
+    # Safety interlock, checked before anything else is loaded or run: a
+    # real call must always see the real current time, in either mode.
+    # --allow-live only ever means "a real call to CALL-E is explicitly
+    # authorized" - independent of whether the compliance policy is
+    # enforced (--mode live) or displayed-but-not-enforced (--mode demo,
+    # the default). --execute is still required as a second, separate
+    # confirmation before anything is ever sent (see the dry-run check
+    # further down, unchanged).
     if args.allow_live and args.now_utc is not None:
         print(
             "error: --now-utc cannot be combined with --allow-live. A real call must always be "
@@ -243,10 +246,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "live" and not decision.allowed:
         # Fully enforced, fail-closed - identical to the original
-        # compliance-gated-callback behavior. Never reached in demo mode:
-        # the interlock above already refuses --allow-live without
-        # --mode live, so this branch is the only path that can ever
-        # actually stop a call before CALL-E.
+        # compliance-gated-callback behavior. Only reachable in --mode
+        # live; in --mode demo (default) a failing decision never stops
+        # the call - see the would_block_in_live branch below instead.
         window = next_legal_window(decision, args.recipient_timezone, now)
         print(f"  Next legal window: {window}", flush=True)
         print_verdict(
@@ -264,11 +266,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.mode == "demo" and would_block_in_live:
+        real_call_note = (
+            " A REAL CALL-E call is about to be placed despite this." if args.allow_live else ""
+        )
         print(
             "*** DEMO MODE: this call would be BLOCKED in live mode ***\n"
             f"    reasons: {decision.blocking_reasons}\n"
-            "    Proceeding anyway because --mode demo. No real call is reachable in this "
-            "mode - see --mode live for enforced behavior.",
+            f"    Proceeding anyway because --mode demo.{real_call_note} Live policy "
+            "violations are warnings only in this mode, not blocks. Use --mode live for "
+            "enforced, fail-closed behavior.",
             flush=True,
         )
 
