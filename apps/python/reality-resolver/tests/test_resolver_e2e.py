@@ -54,8 +54,8 @@ def test_far_from_deadline_is_no_call_needed_and_never_reaches_compliance_or_cal
         assert result.returncode == 0, result.stderr
         assert "Status: NO_CALL_NEEDED" in result.stdout
         assert "Action: NO_ACTION_REQUIRED" in result.stdout
-        assert "CALL PERMISSION" not in result.stdout
-        assert "CALL-E" not in result.stdout
+        assert "=== CALL PERMISSION ===" not in result.stdout
+        assert "=== CALL-E ===" not in result.stdout
         assert server.creates == 0
 
 

@@ -191,32 +191,45 @@ overridden `now` - nothing about the check logic changes, and
 - **`demo` (default)** - a failing compliance gate is displayed in
   full, in `would_block_in_live: True`, and in a `*** DEMO MODE: this
   call would be BLOCKED in live mode ***` banner, but the call still
-  proceeds to CALL-E. Meant for local testing and for judges cloning
-  this repo at any hour, without needing to fake the legal calling
-  window to see the full pipeline.
+  proceeds to CALL-E - **including a real CALL-E call** if `--execute
+  --allow-live` are also passed. A live-policy violation becomes a
+  warning, never a block, in this mode. Meant for local testing and for
+  judges cloning this repo at any hour, without needing to fake the
+  legal calling window to see the full pipeline.
 - **`live`** - a failing compliance gate stops the call:
   `UNRESOLVED_CALL_BLOCKED`, `RETRY_WHEN_PERMITTED`, exactly the
   original, fully enforced, fail-closed `compliance-gated-callback`
   behavior.
 
-**The safety property that makes demo mode safe to default to**:
-`--allow-live` (real API access) refuses to run unless `--mode live` is
-also explicit -
+**`--allow-live` means one thing only: a real call to CALL-E is
+explicitly authorized** (in addition to `--execute`, the separate,
+second confirmation needed before anything is ever sent, in either
+mode) - it is independent of `--mode`. This is a deliberate choice:
+`--mode demo` is meant to let an operator demonstrate the whole
+pipeline, including against the real API, without an inconvenient
+real-world hour hiding it - the honest cost is that **demo mode does
+not stop a real call on a live-policy violation**; the banner and
+`would_block_in_live: True` are the only safeguard once
+`--execute --allow-live` are both present, and they name the
+consequence plainly:
 
 ```
-error: --allow-live requires --mode live (got --mode demo). Demo mode
-never enforces the live compliance policy and must never be combined
-with real API access.
+*** DEMO MODE: this call would be BLOCKED in live mode ***
+    reasons: (...)
+    Proceeding anyway because --mode demo. A REAL CALL-E call is about
+    to be placed despite this. Live policy violations are warnings
+    only in this mode, not blocks. Use --mode live for enforced,
+    fail-closed behavior.
 ```
 
-- so a real call needs three explicit, mutually-consistent flags
-(`--execute --allow-live --mode live`) instead of two - placing a real
-call by mistake is harder than before this flag existed, not easier.
-`--now-utc` is also refused together with `--allow-live`, in either
-mode: a real call must always be evaluated against the real current
-time, never an overridden one - this is unrelated to and does not
-relax the existing rule that `--now-utc` is development/testing-only
-(see "Evidence model" above for R4's use of it).
+Read that banner before ever adding `--allow-live` to a demo-mode
+command. Two things remain true regardless of `--mode`:
+`--now-utc` is refused together with `--allow-live` - a real call
+always sees the real current time, never an overridden one - and
+`--execute`/`--allow-live` are still each individually required before
+anything is ever sent (`--allow-live` alone stays a dry-run;
+`--execute` alone against the real API is refused by `client.py`'s own
+`CallEClient`, untouched, exactly as before this flag existed).
 
 This is a distinct concern from R4/`--now-utc` (which govern whether
 the *evidence* is decision-critical) - `--mode` only governs whether a
