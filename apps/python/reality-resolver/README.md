@@ -157,7 +157,8 @@ resolve anything: `NO_CALL_NEEDED` -> `NO_ACTION_REQUIRED`;
 
 ## CLI output
 
-`resolver.py case.json` prints five sections, in order:
+`resolver.py case.json` prints a mode banner (see "Demo mode vs. live
+mode" below) followed by five sections, in order:
 
 - `EVIDENCE STATE` - every evidence item (source, type, freshness,
   ambiguity, claim).
@@ -165,14 +166,64 @@ resolve anything: `NO_CALL_NEEDED` -> `NO_ACTION_REQUIRED`;
 - `CALL JUSTIFICATION` - whether the uncertainty is decision-critical.
 - `CALL PERMISSION` - only if a call is justified; the compliance
   gate's own output (`client.py`'s `print_compliance_decision`, reused
-  unmodified), plus the next legal window if blocked (`next_window.py` -
-  only computed when every blocking reason is a calling-window check;
-  consent/DNC/disclosure/revocation/solicitation-cap blocks say plainly
-  that there is no next window to wait for).
-- `CALL-E` - only if permitted; the request body preview, and (with
-  `--execute`) the created call and final result.
+  unmodified), a `would_block_in_live` line, and the next legal window
+  if blocked (`next_window.py` - only computed when every blocking
+  reason is a calling-window check; consent/DNC/disclosure/revocation/
+  solicitation-cap blocks say plainly that there is no next window to
+  wait for).
+- `CALL-E` - only if the call proceeds past the permission check
+  (always in demo mode; only when permitted in live mode); the request
+  body preview, and (with `--execute`) the created call and final
+  result.
 - `VERDICT` - status, action, and the evidence cited (the original case
-  evidence plus, when a call was placed, CALL-E's own result).
+  evidence, `mode`/`would_block_in_live`, and, when a call was placed,
+  CALL-E's own result).
+
+## Demo mode vs. live mode
+
+`--mode {demo,live}`, default `demo`. The compliance gate itself
+(`compliance/dispatcher.run_precall_checks`) is evaluated **identically
+in both modes**, against the real recipient timezone and the real or
+overridden `now` - nothing about the check logic changes, and
+`compliance/` is never touched by this flag. What changes is only what
+`resolver.py` does with a failing result:
+
+- **`demo` (default)** - a failing compliance gate is displayed in
+  full, in `would_block_in_live: True`, and in a `*** DEMO MODE: this
+  call would be BLOCKED in live mode ***` banner, but the call still
+  proceeds to CALL-E. Meant for local testing and for judges cloning
+  this repo at any hour, without needing to fake the legal calling
+  window to see the full pipeline.
+- **`live`** - a failing compliance gate stops the call:
+  `UNRESOLVED_CALL_BLOCKED`, `RETRY_WHEN_PERMITTED`, exactly the
+  original, fully enforced, fail-closed `compliance-gated-callback`
+  behavior.
+
+**The safety property that makes demo mode safe to default to**:
+`--allow-live` (real API access) refuses to run unless `--mode live` is
+also explicit -
+
+```
+error: --allow-live requires --mode live (got --mode demo). Demo mode
+never enforces the live compliance policy and must never be combined
+with real API access.
+```
+
+- so a real call needs three explicit, mutually-consistent flags
+(`--execute --allow-live --mode live`) instead of two - placing a real
+call by mistake is harder than before this flag existed, not easier.
+`--now-utc` is also refused together with `--allow-live`, in either
+mode: a real call must always be evaluated against the real current
+time, never an overridden one - this is unrelated to and does not
+relax the existing rule that `--now-utc` is development/testing-only
+(see "Evidence model" above for R4's use of it).
+
+This is a distinct concern from R4/`--now-utc` (which govern whether
+the *evidence* is decision-critical) - `--mode` only governs whether a
+failing *compliance* result is enforced once a call is already
+justified. A demo run can combine both: `--now-utc` near the case's
+deadline to satisfy R4, and `--mode demo` (default) so an inconvenient
+real-world hour never hides the rest of the pipeline.
 
 ## Running the demo
 
