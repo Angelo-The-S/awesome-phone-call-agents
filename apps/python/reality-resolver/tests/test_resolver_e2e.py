@@ -60,10 +60,14 @@ def test_far_from_deadline_is_no_call_needed_and_never_reaches_compliance_or_cal
 
 
 def test_near_deadline_without_consent_is_blocked_with_a_next_window() -> None:
+    """--mode live is required here: this test exercises the fully
+    enforced/fail-closed path (see tests/test_resolver_mode.py for the
+    default demo-mode behavior, which does not stop on this same input).
+    """
     with FakeCalleServer() as server:
         result = _run_resolver(
             server.base_url,
-            ["--now-utc", NEAR_DEADLINE_NOW, "--recipient-timezone", "America/New_York"],
+            ["--mode", "live", "--now-utc", NEAR_DEADLINE_NOW, "--recipient-timezone", "America/New_York"],
         )
 
         assert result.returncode == 0, result.stderr
