@@ -26,6 +26,18 @@ def test_non_time_based_block_has_no_next_window():
     assert "no next window" in result
 
 
+def test_gdpr_basis_only_block_is_named_as_non_time_based():
+    """A missing GDPR basis attestation - the only check still applicable
+    to appointment_confirmation on an EU number, alongside disclosure and
+    revocation - must be named explicitly in the non-time-based message,
+    not just implied by the generic "no next window" conclusion.
+    """
+    decision = _decision(CheckResult("eu_common_gdpr_basis", False, "GDPR Art. 6 lawful basis not documented"))
+    result = next_legal_window(decision, "Europe/Paris", datetime(2026, 9, 8, 14, 0, tzinfo=timezone.utc))
+    assert "GDPR basis" in result
+    assert "no next window" in result
+
+
 def test_mixed_time_and_non_time_block_has_no_next_window():
     """A single non-time-based failure among several is enough to
     refuse guessing a next window - the call would still be blocked

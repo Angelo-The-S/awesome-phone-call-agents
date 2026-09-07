@@ -35,6 +35,7 @@ from client import (
     build_recipient,
     derive_idempotency_key,
     load_dotenv,
+    mask_phone,
     mask_secret,
     parse_utc_timestamp,
     print_compliance_decision,
@@ -42,6 +43,7 @@ from client import (
     redacted_recipient_for_display,
     render_disclosure_script,
     resolve_api_key,
+    sanitize_for_display,
 )
 from compliance.dispatcher import resolve_locale_and_region, run_precall_checks
 from compliance.models import PreCallContext, PreCallDecision
@@ -97,7 +99,12 @@ def print_verdict(verdict: Verdict) -> None:
     print(f"  Action: {verdict.action}", flush=True)
     print("  Evidence cited:", flush=True)
     for item in verdict.evidence_cited:
-        print(f"    - {item}", flush=True)
+        # The CALL-E result line embeds provider values. reconcile() built
+        # them with !r, so control characters are already escaped, but
+        # nothing bounded their length - sanitize here, at the display
+        # layer, rather than in verdict.py: the Verdict object itself must
+        # keep citing what the provider actually returned.
+        print(f"    - {sanitize_for_display(item)}", flush=True)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -131,6 +138,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the real current time.",
     )
     parser.add_argument(
+        "--authorize-destination",
+        default=None,
+        metavar="E164",
+        help="Required together with --allow-live: the exact E.164 number this call is "
+        "authorized to reach. Compared byte-for-byte against the number that will actually be "
+        "sent to CALL-E (the case file's call_phone, or --phone when it overrides it), with no "
+        "normalization of any kind - a number that merely looks equivalent will be refused. "
+        "--allow-live on its own only says 'a real call is authorized'; this says which number "
+        "it may reach.",
+    )
+    parser.add_argument(
         "--now-utc",
         type=parse_utc_timestamp,
         default=None,
@@ -142,13 +160,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--poll-timeout-seconds", type=float, default=None)
     parser.add_argument("--poll-warn-after-seconds", type=float, default=300.0)
 
-    # Compliance context flags - same as client.py's CLI, operator-attested
-    # at call time. Never part of the case JSON: a case describes evidence
-    # about the world, not the operator's own right to place the call.
+    # Compliance context flags - operator-attested at call time, same
+    # mechanism client.py's own compliance gate has always used. Never
+    # part of the case JSON: a case describes evidence about the world,
+    # not the operator's own right to place the call.
     parser.add_argument("--consent-obtained", action="store_true")
     parser.add_argument("--consent-timestamp", type=parse_utc_timestamp, default=None)
     parser.add_argument("--dnc-checked", action="store_true")
-    parser.add_argument("--gdpr-basis-documented", action="store_true")
+    parser.add_argument(
+        "--gdpr-basis-documented",
+        action="store_true",
+        help="Attests that a GDPR Art. 6 lawful basis for processing this recipient's personal "
+        "data has been identified and documented - required for any EU number, regardless of "
+        "use case, since this obligation is not scoped to commercial solicitation. This is not "
+        "marketing consent: for appointment_confirmation, the relevant basis is ordinarily "
+        "Art. 6(1)(b) (necessary to perform an existing appointment/service) or Art. 6(1)(f) "
+        "(legitimate interest in confirming it) - not Art. 6(1)(a) (consent), which does not "
+        "apply here. Passing this flag never creates that basis; it only attests that the "
+        "operator has already identified and documented one for this specific call.",
+    )
     parser.add_argument("--recipient-timezone", default=None, help="IANA timezone name, for example Europe/Paris.")
     parser.add_argument("--intends-to-record", action="store_true")
     parser.add_argument("--solicitations-in-last-24h", type=int, default=None)
@@ -177,6 +207,36 @@ def main(argv: list[str] | None = None) -> int:
     case = load_case(args.case)
     if args.phone:
         case = replace(case, call_phone=args.phone)
+
+    # Destination authorization, checked here because this is the first
+    # point where the final number is known: --phone has already
+    # overridden the case file's call_phone, so case.call_phone from here
+    # on is exactly the string build_recipient() will put in the request
+    # body. Comparison is byte-exact and deliberately does no
+    # normalization - no stripping, no reformatting, no country-code
+    # inference - so a number that merely looks equivalent can never
+    # authorize a different one. --allow-live alone declares intent to
+    # place a real call; it does not say which number that call may
+    # reach, and this is what makes that explicit. Refused before the
+    # evidence engine runs and long before any client is constructed, so
+    # nothing can reach the network.
+    if args.allow_live and args.authorize_destination != case.call_phone:
+        if args.authorize_destination is None:
+            print(
+                "error: --allow-live requires --authorize-destination <E.164> naming the exact "
+                "number this call may reach. Nothing was sent.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "error: --authorize-destination does not match the call's resolved destination "
+                f"({mask_phone(args.authorize_destination)} authorized, "
+                f"{mask_phone(case.call_phone)} would be called). The authorized number must "
+                "match exactly, with no reformatting. Nothing was sent.",
+                file=sys.stderr,
+            )
+        return 1
+
     now = args.now_utc or datetime.now(timezone.utc)
 
     print(f"Case: {case.name}", flush=True)
@@ -294,19 +354,32 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    # call_id keeps the provider's raw value - it is what a later
+    # GET /v1/calls/{id} must be built from - while everything printed
+    # goes through sanitize_for_display first: these lines interpolate
+    # provider-controlled strings directly, unlike the response bodies
+    # below, which json.dumps already escapes.
     call_id = created["id"]
-    print(f"Created call {call_id} with status {created['status']}", flush=True)
+    print(
+        f"Created call {sanitize_for_display(call_id)} "
+        f"with status {sanitize_for_display(created.get('status'))}",
+        flush=True,
+    )
 
     poll_started_at = time.monotonic()
 
     def report(call: dict[str, Any]) -> None:
         elapsed_seconds = time.monotonic() - poll_started_at
-        print(f"Poll: status={call.get('status')} (elapsed: {elapsed_seconds:.0f}s)", flush=True)
+        print(
+            f"Poll: status={sanitize_for_display(call.get('status'))} "
+            f"(elapsed: {elapsed_seconds:.0f}s)",
+            flush=True,
+        )
 
     def report_warning(minutes_elapsed: float, call: dict[str, Any]) -> None:
         print(
             f"This call has been in progress for over {minutes_elapsed:.0f} minutes. Still "
-            f"watching... (last status: {call.get('status')!r})",
+            f"watching... (last status: {sanitize_for_display(call.get('status'))})",
             flush=True,
         )
 
@@ -320,7 +393,11 @@ def main(argv: list[str] | None = None) -> int:
             on_warn=report_warning,
         )
     except KeyboardInterrupt:
-        print(f"\nStopped watching call {call_id} (Ctrl+C). The call itself was not canceled.", file=sys.stderr)
+        print(
+            f"\nStopped watching call {sanitize_for_display(call_id)} (Ctrl+C). "
+            "The call itself was not canceled.",
+            file=sys.stderr,
+        )
         return 1
     except (CallEAPIError, TimeoutError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)

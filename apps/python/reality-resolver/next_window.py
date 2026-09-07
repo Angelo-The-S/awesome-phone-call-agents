@@ -2,9 +2,9 @@
 UNRESOLVED_CALL_BLOCKED path.
 
 Only meaningful when every blocking reason is a calling-window check;
-consent, DNC, disclosure, revocation, and the Oregon solicitation cap
-are not time-based and do not resolve themselves by waiting, so this
-says so plainly instead of guessing a date.
+consent, DNC, disclosure, revocation, GDPR basis, and the Oregon
+solicitation cap are not time-based and do not resolve themselves by
+waiting, so this says so plainly instead of guessing a date.
 
 Reuses each jurisdiction module's own window constants directly
 (compliance/jurisdictions/us_federal.py, us_oregon.py, fr.py) rather
@@ -60,8 +60,8 @@ def next_legal_window(decision: PreCallDecision, recipient_timezone: str | None,
         return "call is not blocked"
     if not all(result.check_name.endswith(_CALLING_WINDOW_CHECK_SUFFIX) for result in blocking):
         return (
-            "blocked for a non-time-based reason (consent, DNC, disclosure, revocation, or the "
-            "Oregon solicitation cap); no next window to compute"
+            "blocked for a non-time-based reason (consent, DNC, disclosure, revocation, GDPR "
+            "basis, or the Oregon solicitation cap); no next window to compute"
         )
 
     try:

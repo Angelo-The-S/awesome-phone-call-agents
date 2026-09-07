@@ -91,6 +91,9 @@ def test_unmapped_jurisdiction_still_blocks_regardless_of_use_case() -> None:
     with FakeCalleServer() as server:
         result = _run_resolver(
             server.base_url,
+            # Ofcom's reserved drama range 020 7946 0xxx - a +44 number so
+            # it resolves to no jurisdiction chain at all (only +1 and +33
+            # are mapped), which is exactly what this test needs.
             ["--phone", "+442079460123", "--now-utc", NEAR_DEADLINE_NOW],
         )
 
@@ -151,3 +154,89 @@ def test_execute_voicemail_is_unresolved_ambiguous_never_release_slot() -> None:
         assert "Status: UNRESOLVED_AMBIGUOUS" in result.stdout
         assert "Action: HUMAN_REVIEW" in result.stdout
         assert "RELEASE_SLOT" not in result.stdout
+
+
+# --- P4: exact-destination authorization ------------------------------
+#
+# --allow-live declares "a real call is authorized"; --authorize-destination
+# says which number it may reach. Every one of these refusals happens before
+# any client is constructed, so server.creates stays 0 throughout - the fake
+# server here only proves nothing was sent, never that a real call happened.
+
+AUTHORIZED = "+12025550123"  # the shipped case's call_phone
+OTHER_NUMBER = "+15035550100"  # NANP reserved, different from the case's
+
+
+def test_allow_live_with_matching_authorized_destination_is_accepted() -> None:
+    """Authorization satisfied: the run proceeds past the destination gate
+    and stops at the dry-run boundary (no --execute), proving the gate let
+    it through rather than that a real call was placed.
+    """
+    with FakeCalleServer() as server:
+        result = _run_resolver(
+            server.base_url,
+            ["--allow-live", "--authorize-destination", AUTHORIZED],
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "does not match" not in result.stderr
+        assert "requires --authorize-destination" not in result.stderr
+        assert server.creates == 0
+
+
+def test_allow_live_with_different_destination_is_refused() -> None:
+    with FakeCalleServer() as server:
+        result = _run_resolver(
+            server.base_url,
+            ["--allow-live", "--authorize-destination", OTHER_NUMBER, "--execute"],
+        )
+
+        assert result.returncode == 1
+        assert "does not match the call's resolved destination" in result.stderr
+        assert "=== CALL-E ===" not in result.stdout
+        assert server.creates == 0
+
+
+def test_allow_live_without_authorize_destination_is_refused() -> None:
+    with FakeCalleServer() as server:
+        result = _run_resolver(server.base_url, ["--allow-live", "--execute"])
+
+        assert result.returncode == 1
+        assert "requires --authorize-destination" in result.stderr
+        assert server.creates == 0
+
+
+def test_phone_override_means_only_the_final_number_can_be_authorized() -> None:
+    """--phone replaces the case file's call_phone, so authorizing the
+    case file's original number must NOT authorize the overridden call -
+    only the number actually about to be dialled counts.
+    """
+    with FakeCalleServer() as server:
+        stale = _run_resolver(
+            server.base_url,
+            ["--phone", OTHER_NUMBER, "--allow-live", "--authorize-destination", AUTHORIZED, "--execute"],
+        )
+        assert stale.returncode == 1
+        assert "does not match the call's resolved destination" in stale.stderr
+
+        matching = _run_resolver(
+            server.base_url,
+            ["--phone", OTHER_NUMBER, "--allow-live", "--authorize-destination", OTHER_NUMBER],
+        )
+        assert matching.returncode == 0, matching.stderr
+        assert "does not match" not in matching.stderr
+        assert server.creates == 0
+
+
+def test_fake_target_without_allow_live_needs_no_authorization() -> None:
+    """No regression for the ordinary fake-server path: without
+    --allow-live there is no real call to authorize, so the new flag is
+    not required and the full pipeline still runs to a verdict.
+    """
+    with FakeCalleServer() as server:
+        result = _run_resolver(server.base_url, ["--now-utc", NEAR_DEADLINE_NOW, "--execute"])
+
+        assert result.returncode == 0, result.stderr
+        assert "authorize-destination" not in result.stderr
+        assert "Status: RESOLVED" in result.stdout
+        assert server.creates == 1

@@ -202,12 +202,21 @@ and hard-enforced, for every call, real or fake, with no mode or flag
 that bypasses or merely warns about a failing one.
 
 For a EU number, `--gdpr-basis-documented` still gates the call exactly
-as before - only the *meaning* of what's being attested changes: for
-`appointment_confirmation` the underlying legal basis an operator would
-document is ordinarily legitimate interest or contract performance, not
-marketing consent, since there is no marketing consent to document in
-the first place. The flag itself is unchanged; the semantics behind it
-are use-case-dependent, same as they always implicitly were.
+as before - GDPR Art. 6 requires a lawful basis for processing personal
+data regardless of whether the call is commercial, so this check is
+never exempted for any use case. Only the *meaning* of what's being
+attested changes: for `appointment_confirmation`, passing this flag
+attests that the operator has identified and documented a basis
+applicable to confirming an *existing* appointment - ordinarily Art.
+6(1)(b) (necessary to perform that appointment/service) or Art. 6(1)(f)
+(legitimate interest in confirming it) - not Art. 6(1)(a) (marketing
+consent), which has no place in this use case at all. The flag itself,
+and the requirement that an operator explicitly attest it before every
+real EU call, are unchanged: this stays a human attestation made at
+call time, never a value read from the case file, and never assumed
+true just because the use case is `appointment_confirmation` - a
+non-commercial purpose narrows *which* basis applies, it does not
+remove the need to have and document one.
 
 **Honest limit.** For a US number under `appointment_confirmation`, once
 the commercial-specific checks are filtered out, the only checks left
@@ -283,6 +292,11 @@ The shipped `cases/ghost-appointment.json` uses a reserved, non-routable
 NANP placeholder number (`+12025550123`) - never a real one. Pass
 `--phone` to override it for a real call; do not edit or commit a real
 number into a case file.
+
+A real call additionally requires `--allow-live` and
+`--authorize-destination <the same E.164 number>`, on top of
+`--execute` - see the Safety section for what each of the three
+authorizes. None of the fake-server commands above need them.
 
 ## The compliance gate (reused infrastructure)
 
@@ -556,13 +570,26 @@ priority over whatever is in `.env`.
 
 ## Safety
 
-- A real call requires explicit intent at two independent points:
-  `--execute` to attempt it at all, and `--allow-live` in addition
-  before it can reach `https://api.heycall-e.com` - enforced in code
-  (`CallEClient.__post_init__`), not just documented. The compliance
-  gate (filtered by use case, see above) is always fully enforced,
-  fail-closed, for a real call, with no mode or flag that bypasses or
-  merely warns about a still-applicable failing check.
+- A real call requires explicit intent at three independent points:
+  `--execute` to attempt it at all, `--allow-live` before it can reach
+  `https://api.heycall-e.com` (enforced in code by
+  `CallEClient.__post_init__`, not just documented), and
+  `--authorize-destination <E.164>` naming the exact number the call may
+  reach. The three answer different questions - *send anything at all?*,
+  *against the real API?*, *to which number?* - and none of them implies
+  the others.
+- `--authorize-destination` is compared byte-for-byte against the number
+  that will actually be sent to CALL-E: the case file's `call_phone`, or
+  `--phone` when it overrides it. No normalization is applied - no
+  stripping, no reformatting, no country-code inference - so a number
+  that merely looks equivalent can never authorize a different one, and
+  authorizing a case file's original number does not authorize a
+  `--phone` override of it. A missing or mismatched value is refused
+  before the evidence engine runs and long before any HTTP client is
+  constructed, so nothing reaches the network.
+- The compliance gate (filtered by use case, see above) is always fully
+  enforced, fail-closed, for a real call, with no mode or flag that
+  bypasses or merely warns about a still-applicable failing check.
 - Dry-run is the default: without `--execute`, the exact request body
   and the compliance decision are printed and nothing is sent.
 - Nothing about the recipient is guessed: for a still-applicable
@@ -624,9 +651,18 @@ priority over whatever is in `.env`.
   limitation at the moment a real call is created.
 - Every phone number in this README and the test suite is from an
   officially regulator-reserved block, not just "unlikely to be real":
-  US examples use the NANP `NPA-555-01XX` block. `fake_server.py`'s
-  internal sentinel numbers (`+10000000001` through `+10000000005`) use
-  area code `000`, which cannot be a real NANP number at all.
+  US examples use the NANP `NPA-555-01XX` block (including the Oregon
+  area-code example); French examples use ARCEP's mobile fiction block
+  `06 39 98` (Numbering Plan Art. 2.5.12); the one +44 number, used to
+  exercise an unmapped jurisdiction, comes from Ofcom's reserved drama
+  range `020 7946 0xxx` (plus `07700 900xxx`, its reserved mobile
+  equivalent). `fake_server.py`'s internal sentinel numbers
+  (`+10000000001` through `+10000000005`) use area code `000`, which
+  cannot be a real NANP number at all. The only two values not from a
+  reserved block are the E.164 length boundaries in `test_client.py`
+  (7 and 15 digits): no reserved block exists at those lengths, and both
+  are structurally impossible to route - `+1` followed by 6 or 14 digits
+  is not a dialable NANP number.
 - The full test suite (`uv run pytest`) runs entirely against
   `fake_server.py`; no test reaches `api.heycall-e.com` or requires a
   live credential.
