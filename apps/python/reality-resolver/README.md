@@ -411,7 +411,7 @@ authorizes. None of the fake-server commands above need them.
 > layer unmodified, as one component among several - the same way it
 > would reuse any other tested library. It is not an evolution of that
 > product, and the sections below describe what that reused layer does
-> in general, not what Reality Resolver's own use case needs (see
+> in general, not what Reality Resolver's own use cases need (see
 > "Compliance by use case" above for that).
 
 Resolving a phone number to its applicable jurisdiction(s) and running
@@ -464,6 +464,45 @@ country.
    table for the use cases they don't apply to - do not leave a
    solicitation-specific rule silently blocking a non-commercial use
    case, or silently exempted from a commercial one.
+
+### Adding a use case
+
+The two shipped use cases differ only in data. Adding a third should
+too:
+
+1. Write `cases/<your-case>.json`. All eight fields are required -
+   `load_case` reads each with `data["..."]` and raises rather than
+   defaulting, so a typo fails loudly instead of silently changing
+   behavior. `deadline` is an absolute ISO 8601 UTC timestamp,
+   `decision_deadline_threshold_hours` is R4's proximity cutoff for
+   this case specifically, and `decision_options` supplies the two
+   domain action labels under `if_confirmed`/`if_cancelled`. Put the
+   domain vocabulary in `call_task_hint` - that is the text the call
+   is actually about.
+2. Register the `use_case` string in
+   `compliance/use_cases.py`'s `_EXEMPT_SUFFIXES_BY_USE_CASE`. An
+   unregistered value raises `UnknownUseCaseError` and refuses the
+   call, so this step is not optional. Exempt a check-name suffix only
+   when the source statute's own scoping justifies it for this use
+   case; if you cannot point at that scoping, map to the full check
+   set rather than inventing an exemption.
+3. Add end-to-end tests in `tests/test_resolver_e2e.py` via
+   `_run_resolver(..., case=<your case>)` against `FakeCalleServer`,
+   using its reserved phones to reach each branch. Cover
+   `NO_CALL_NEEDED`, both resolving branches, and - the one that
+   matters most - that voicemail yields `HUMAN_REVIEW` and never your
+   `if_cancelled` action.
+4. Add a row to the use-case table at the top of this README.
+
+Nothing in `evidence/`, `verdict.py`, or `compliance/jurisdictions/`
+should need to change. If it does, that is the signal to look at:
+something domain-specific has leaked into the generic layer. That is
+exactly what happened once already - the `subject_intent` field
+description in `verdict.py` was written in appointment vocabulary, and
+because `fake_server.py` selects its canned result by property name
+rather than by description, no test could see it. Field *descriptions*
+in the result schema are read by CALL-E's extraction model, so they
+have to stay domain-neutral even though nothing local depends on them.
 
 ## AI disclosure
 
