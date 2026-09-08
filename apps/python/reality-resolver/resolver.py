@@ -55,7 +55,7 @@ from verdict import (
     ACTION_NO_ACTION_REQUIRED,
     ACTION_RETRY_WHEN_PERMITTED,
     Verdict,
-    patient_intent_result_schema,
+    subject_intent_result_schema,
     reconcile,
 )
 
@@ -316,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     hardened_task = build_hardened_task(case.call_task_hint, disclosure_script=disclosure_script)
     recipient = build_recipient(case.call_phone, locale, region)
-    result_schema = patient_intent_result_schema()
+    result_schema = subject_intent_result_schema()
 
     print("=== CALL-E ===", flush=True)
     body_preview = {
