@@ -32,19 +32,45 @@ LIVE_FIXTURE = "ghost-appointment-live-test"
 
 
 @contextmanager
-def api_server() -> Iterator[str]:
+def api_server_and_backend() -> Iterator[tuple[str, Any]]:
+    """The HTTP server and the fake CALL-E backend, started and stopped
+    separately - the same split create_server() enforces in production
+    code, so a test cannot accidentally depend on one starting the other.
+    """
+    from api.backend import FakeCallBackend
     from api.server import create_server
 
-    server = create_server("127.0.0.1", 0)
+    backend = FakeCallBackend()
+    backend.start()
+    server = create_server("127.0.0.1", 0, backend=backend)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.0005}, daemon=True)
     thread.start()
     host, port = server.server_address[:2]
     try:
-        yield f"http://{host}:{port}"
+        yield f"http://{host}:{port}", backend
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+        backend.stop()
+
+
+@contextmanager
+def api_server() -> Iterator[str]:
+    with api_server_and_backend() as (base_url, _):
+        yield base_url
+
+
+def post(base_url: str, path: str, payload: Any) -> tuple[int, Any, dict[str, str]]:
+    data = payload if isinstance(payload, (bytes, bytearray)) else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}{path}", data=data, method="POST", headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.status, json.loads(response.read()), dict(response.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read()), dict(exc.headers)
 
 
 def request(base_url: str, path: str, method: str = "GET") -> tuple[int, Any, dict[str, str]]:
@@ -166,10 +192,13 @@ def test_unknown_route_is_a_json_404_without_a_traceback() -> None:
 
 
 def test_unknown_route_is_404_even_for_post() -> None:
+    """Route before method: an unknown path is 404 whatever the verb, and
+    405 stays reserved for an endpoint that exists.
+    """
     with api_server() as base_url:
-        status, body, _ = request(base_url, "/api/resolutions", method="POST")
+        status, body, _ = request(base_url, "/api/does-not-exist", method="POST")
 
-        assert status == 404, "no resolution endpoint exists in this phase"
+        assert status == 404
         assert body["error"]["code"] == "not_found"
 
 
@@ -233,23 +262,46 @@ def test_no_response_leaks_a_credential_or_internal_path(monkeypatch: pytest.Mon
 # --- I. import safety ------------------------------------------------
 
 
-def test_importing_the_server_starts_nothing_and_pulls_in_no_call_path() -> None:
-    """The boundary this phase claims: HTTP cannot reach CALL-E, because
-    the modules that can are not even loaded.
+def test_the_http_layer_makes_no_decision_of_its_own() -> None:
+    """The HTTP layer now calls pipeline.resolve(), and that is the only
+    engine call it is allowed to make.
+
+    This replaces a narrower check that simply asserted the pipeline was
+    not imported at all - true while there was no resolution endpoint,
+    and superseded the moment there was one. The guarantee worth keeping
+    is stronger and is the one that stops the engine being reimplemented
+    behind HTTP: the handler may not score rules, build a compliance
+    context, run or filter checks, reconcile a result, or construct a
+    provider client. Exactly one function orchestrates a resolution, for
+    the CLI and for HTTP alike.
     """
-    for name in [m for m in list(sys.modules) if m.startswith("api") or m in ("pipeline", "client")]:
-        del sys.modules[name]
-
-    import api.server  # noqa: F401
-
-    assert "pipeline" not in sys.modules, "the HTTP layer must not import the pipeline in this phase"
-    # api.serialize imports mask_phone from client, so client is expected;
-    # what matters is that no client can be constructed from a route.
     import api.server as server_module
 
     source = Path(server_module.__file__).read_text(encoding="utf-8")
-    for forbidden in ("CallEClient", "create_call", "poll_until_terminal", "resolve(", "from pipeline"):
-        assert forbidden not in source, f"{forbidden} must not appear in the HTTP layer yet"
+    for forbidden in (
+        "evaluate(",
+        "run_precall_checks(",
+        "apply_use_case(",
+        "reconcile(",
+        "PreCallContext(",
+        "CallEClient(",
+        "create_call(",
+        "poll_until_terminal(",
+        "decision_options[",
+    ):
+        assert forbidden not in source, f"{forbidden} in the HTTP layer duplicates the pipeline"
+
+    assert "resolve(request)" in source, "the handler must delegate the whole run to the pipeline"
+
+
+def test_importing_the_server_starts_nothing() -> None:
+    for name in [m for m in list(sys.modules) if m.startswith("api")]:
+        del sys.modules[name]
+    before = threading.active_count()
+
+    import api.server  # noqa: F401
+
+    assert threading.active_count() == before, "importing the module must not start a listener"
 
 
 def test_create_server_does_not_serve_until_asked() -> None:
@@ -436,3 +488,469 @@ def test_an_oversized_declared_body_closes_rather_than_being_read() -> None:
         assert status == 405
         assert content_type == "application/json"
         assert response.will_close
+
+
+# --- 3.1 store bridge -------------------------------------------------
+
+
+def test_path_for_returns_the_served_case_file() -> None:
+    store = CaseStore()
+    for name in store.names():
+        path = store.path_for(name)
+        assert path.is_file()
+        assert path.name == f"{name}.json"
+        assert path.parent.name == "cases"
+
+
+def test_path_for_uses_the_same_allowlist_as_get() -> None:
+    """A looser check here than in get() would be a bypass with extra
+    steps: path_for is what a request reaches.
+    """
+    store = CaseStore()
+    for name in (
+        LIVE_FIXTURE,
+        f"{LIVE_FIXTURE}.json",
+        "../client",
+        "../../README",
+        "cases/ghost-appointment",
+        "ghost-appointment/../ghost-appointment-live-test",
+        "/etc/passwd",
+        "",
+    ):
+        with pytest.raises(CaseNotFoundError):
+            store.path_for(name)
+
+
+# --- 3.2 backend lifecycle -------------------------------------------
+
+
+def test_backend_starts_and_stops_without_leaving_a_listener() -> None:
+    from api.backend import BackendNotRunningError, FakeCallBackend
+
+    backend = FakeCallBackend()
+    assert backend.running is False
+    with pytest.raises(BackendNotRunningError):
+        backend.base_url
+
+    backend.start()
+    assert backend.running is True
+    base_url = backend.base_url
+    assert base_url.startswith("http://127.0.0.1:"), "the fake backend must stay on loopback"
+
+    backend.stop()
+    assert backend.running is False
+    host, port = base_url.removeprefix("http://").split(":")
+    with pytest.raises((urllib.error.URLError, OSError)):
+        urllib.request.urlopen(f"http://{host}:{port}/v1/calls/x", timeout=1)
+
+
+def test_backend_start_and_stop_are_idempotent() -> None:
+    from api.backend import FakeCallBackend
+
+    backend = FakeCallBackend()
+    backend.stop()  # never started
+    backend.start()
+    first = backend.base_url
+    backend.start()  # again
+    assert backend.base_url == first
+    backend.stop()
+    backend.stop()  # again
+    assert backend.running is False
+
+
+def test_create_server_does_not_start_the_backend() -> None:
+    """Separate lifecycles: a forgotten stop must be visible, not
+    absorbed by the HTTP server's own shutdown.
+    """
+    from api.server import create_server
+
+    server = create_server("127.0.0.1", 0)
+    try:
+        assert server.backend.running is False
+    finally:
+        server.server_close()
+
+
+# --- 3.3 resolution store --------------------------------------------
+
+
+def test_resolution_ids_are_opaque_and_unique() -> None:
+    from api.store import ResolutionStore
+
+    ids = {ResolutionStore.new_id() for _ in range(200)}
+    assert len(ids) == 200, "ids must not collide"
+    for value in ids:
+        assert value.startswith("res_")
+        assert len(value) > 12
+        # Nothing about the resolution may be recoverable from its id.
+        for leak in ("critical", "ghost", "+1", "2026", "confirmed"):
+            assert leak not in value
+
+
+def test_resolution_store_is_bounded_and_evicts_oldest_first() -> None:
+    from api.store import ResolutionNotFoundError, ResolutionStore
+
+    store = ResolutionStore(max_entries=3)
+    ids = []
+    for index in range(5):
+        rid = ResolutionStore.new_id()
+        ids.append(rid)
+        store.put(rid, {"n": index})
+
+    assert len(store) == 3
+    for evicted in ids[:2]:
+        with pytest.raises(ResolutionNotFoundError):
+            store.get(evicted)
+    for kept in ids[2:]:
+        assert store.get(kept)["n"] in (2, 3, 4)
+
+
+# --- 3.5 POST /api/resolutions: the five branches --------------------
+
+NEAR = "2026-09-10T20:00:00Z"
+FAR = "2026-09-01T10:00:00Z"
+HERO = "critical-service-escalation"
+
+
+def test_no_call_needed_never_reaches_the_gate_or_the_backend() -> None:
+    with api_server_and_backend() as (base_url, backend):
+        status, body, _ = post(base_url, "/api/resolutions", {"case": HERO, "now_utc": FAR})
+
+        assert status == 201
+        assert body["state"] == "completed"
+        assert body["call_decision"] == "NO_CALL_NEEDED"
+        assert body["reasoning"]["decision_critical"] is False
+        assert body["compliance"] is None
+        assert body["call"]["placed"] is False
+        assert body["verdict"] == {"status": "NO_CALL_NEEDED", "action": "NO_ACTION_REQUIRED"}
+        assert backend.creates == 0
+
+
+def test_blocked_scenario_is_refused_by_the_real_hard_gate() -> None:
+    with api_server_and_backend() as (base_url, backend):
+        status, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "scenario": "blocked", "now_utc": NEAR}
+        )
+
+        assert status == 201
+        assert body["reasoning"]["decision_critical"] is True
+        assert body["call_decision"] == "CALL_JUSTIFIED"
+        assert body["compliance"]["allowed"] is False
+        assert body["verdict"]["status"] == "UNRESOLVED_CALL_BLOCKED"
+        assert body["verdict"]["action"] == "RETRY_WHEN_PERMITTED"
+        assert body["call"]["placed"] is False
+        assert backend.creates == 0, "a blocked call must never reach the backend"
+
+
+def test_confirmed_scenario_resolves_to_the_cases_own_action() -> None:
+    with api_server_and_backend() as (base_url, backend):
+        status, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "scenario": "confirmed", "now_utc": NEAR}
+        )
+
+        assert status == 201
+        assert body["verdict"] == {"status": "RESOLVED", "action": "CONTINUE_DISPATCH"}
+        assert body["call"]["placed"] is True
+        assert body["call"]["provider_status"] == "completed"
+        assert body["call"]["result"]["subject_intent"] == "confirmed"
+        assert backend.creates == 1
+
+
+def test_cancelled_scenario_resolves_to_the_cases_own_alternate_action() -> None:
+    with api_server() as base_url:
+        _, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "scenario": "cancelled", "now_utc": NEAR}
+        )
+
+        assert body["verdict"] == {"status": "RESOLVED_ALT", "action": "REASSIGN_TECHNICIAN"}
+
+
+def test_voicemail_is_human_review_and_never_the_cancelled_action() -> None:
+    """The absolute rule at the HTTP boundary: silence is not a
+    cancellation, and no field of the response may say otherwise.
+    """
+    with api_server() as base_url:
+        _, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "scenario": "voicemail", "now_utc": NEAR}
+        )
+
+        assert body["verdict"] == {"status": "UNRESOLVED_AMBIGUOUS", "action": "HUMAN_REVIEW"}
+        raw = json.dumps(body)
+        assert "REASSIGN_TECHNICIAN" not in raw.replace('"if_cancelled": "REASSIGN_TECHNICIAN"', "")
+        assert body["verdict"]["action"] != body["case"]["decision_options"]["if_cancelled"]
+
+
+def test_the_other_shipped_use_case_runs_through_the_same_endpoint() -> None:
+    with api_server() as base_url:
+        _, body, _ = post(
+            base_url, "/api/resolutions", {"case": "ghost-appointment", "now_utc": NEAR}
+        )
+
+        assert body["verdict"] == {"status": "RESOLVED", "action": "KEEP_SLOT"}
+        assert body["case"]["use_case"] == "appointment_confirmation"
+
+
+# --- 3.5 GET /api/resolutions/{id} -----------------------------------
+
+
+def test_a_created_resolution_can_be_read_back_unchanged() -> None:
+    with api_server() as base_url:
+        _, created, _ = post(base_url, "/api/resolutions", {"case": HERO, "now_utc": NEAR})
+        status, fetched, _ = request(base_url, f"/api/resolutions/{created['id']}")
+
+        assert status == 200
+        assert fetched == created
+
+
+def test_an_unknown_resolution_is_a_uniform_404() -> None:
+    with api_server() as base_url:
+        for path in ("/api/resolutions/res_nope", "/api/resolutions/../cases", "/api/resolutions/x/y"):
+            status, body, _ = request(base_url, path)
+            assert status == 404
+            assert "Traceback" not in json.dumps(body)
+            assert path not in json.dumps(body)
+
+
+def test_the_collection_with_a_trailing_slash_is_still_the_collection() -> None:
+    """The path normalizer strips a trailing slash, so /api/resolutions/
+    is the collection - which takes POST, not GET. Pinned because it is
+    the one place an empty id could otherwise look like a resolution.
+    """
+    with api_server() as base_url:
+        status, _, headers = request(base_url, "/api/resolutions/")
+        assert status == 405
+        assert headers["Allow"] == "POST"
+
+
+def test_post_to_a_specific_resolution_is_405() -> None:
+    with api_server() as base_url:
+        status, _, headers = request(base_url, "/api/resolutions/res_x", method="POST")
+        assert status == 405
+        assert headers["Allow"] == "GET"
+
+
+def test_get_on_the_collection_is_405() -> None:
+    with api_server() as base_url:
+        status, body, headers = request(base_url, "/api/resolutions")
+        assert status == 405
+        assert headers["Allow"] == "POST"
+        assert body["error"]["code"] == "method_not_allowed"
+
+
+# --- 3.5 request validation and no-bypass ----------------------------
+
+
+def test_malformed_json_is_400() -> None:
+    with api_server() as base_url:
+        for payload in (b"{not json", b"", b"[]", b'"a string"'):
+            status, body, _ = post(base_url, "/api/resolutions", payload)
+            assert status == 400
+            assert body["error"]["code"] == "invalid_json"
+            assert "Traceback" not in json.dumps(body)
+
+
+def test_an_unknown_case_is_404_and_reveals_nothing_about_the_filesystem() -> None:
+    with api_server() as base_url:
+        for name in ("nope", LIVE_FIXTURE, "../client", "ghost-appointment.json"):
+            status, body, _ = post(base_url, "/api/resolutions", {"case": name})
+            assert status == 404
+            assert body["error"]["code"] == "case_not_found"
+            assert name not in json.dumps(body), "the response must not echo the requested name"
+
+
+def test_an_invalid_scenario_is_422() -> None:
+    with api_server() as base_url:
+        for scenario in ("live", "REAL", "", None, 1, "resolved"):
+            status, body, _ = post(
+                base_url, "/api/resolutions", {"case": HERO, "scenario": scenario}
+            )
+            assert status == 422
+            assert body["error"]["code"] == "invalid_scenario"
+
+
+def test_an_invalid_case_field_is_422() -> None:
+    with api_server() as base_url:
+        for case in (None, 1, "", [], {}):
+            status, body, _ = post(base_url, "/api/resolutions", {"case": case})
+            assert status == 422
+            assert body["error"]["code"] == "invalid_case"
+
+
+def test_an_invalid_now_utc_is_422() -> None:
+    with api_server() as base_url:
+        for value in ("yesterday", "2026-13-45", 1757000000, None):
+            status, body, _ = post(base_url, "/api/resolutions", {"case": HERO, "now_utc": value})
+            assert status == 422
+            assert body["error"]["code"] == "invalid_now_utc"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["base_url", "execute", "allow_live", "authorize_destination", "phone", "phone_override",
+     "api_key", "CALLE_API_KEY", "case_path", "poll_interval_seconds", "mode"],
+)
+def test_no_request_field_can_steer_the_engine(field: str) -> None:
+    """Every knob that decides who gets called, or whether a real call is
+    made, is refused at the door rather than ignored - so a client that
+    tries hears about it instead of silently getting fake-mode behaviour
+    it did not ask for.
+    """
+    with api_server_and_backend() as (base_url, backend):
+        status, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "now_utc": NEAR, field: "anything"}
+        )
+
+        assert status == 422, f"{field} must be refused, not ignored"
+        assert body["error"]["code"] == "unknown_field"
+        assert backend.creates == 0, "a refused request must not have run anything"
+
+
+def test_the_api_never_talks_to_the_real_provider() -> None:
+    """base_url comes from the backend this process started. There is no
+    request shape that changes it, and no live mode to select.
+    """
+    import api.server as server_module
+
+    source = Path(server_module.__file__).read_text(encoding="utf-8")
+    assert "api.heycall-e.com" not in source
+    assert "allow_live=False" in source
+    assert "base_url=self.backend.base_url" in source
+
+    with api_server() as base_url:
+        _, body, _ = request(base_url, "/api/health")
+        assert body["mode"] == "fake"
+
+
+def test_resolutions_work_without_any_calle_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CALLE_API_KEY", raising=False)
+    with api_server() as base_url:
+        status, body, _ = post(base_url, "/api/resolutions", {"case": HERO, "now_utc": NEAR})
+        assert status == 201
+        assert body["verdict"]["status"] == "RESOLVED"
+
+
+# --- 3.4 serializer: what must never come out ------------------------
+
+
+def _every_resolution_response(base_url: str) -> list[dict[str, Any]]:
+    bodies = []
+    for scenario in ("confirmed", "cancelled", "voicemail", "blocked"):
+        _, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "scenario": scenario, "now_utc": NEAR}
+        )
+        bodies.append(body)
+    _, body, _ = post(base_url, "/api/resolutions", {"case": HERO, "now_utc": FAR})
+    bodies.append(body)
+    return bodies
+
+
+def test_no_provider_internal_reaches_a_resolution_response() -> None:
+    case = load_case(HERE / "cases" / f"{HERO}.json")
+    with api_server() as base_url:
+        for body in _every_resolution_response(base_url):
+            raw = json.dumps(body)
+
+            assert case.call_phone not in raw, "the recipient number leaked"
+            assert not re.search(r"\+[1-9][0-9]{6,14}", raw), "an unmasked E.164 number leaked"
+            assert case.call_task_hint[:40] not in raw, "call_task_hint leaked"
+            assert "Required disclosure" not in raw, "the hardened task leaked"
+            assert "transcript" not in raw
+            assert "Hello from the fake server" not in raw, "a transcript turn leaked"
+            assert "provider_call_id" not in raw
+            assert "call_fake" not in raw, "a provider id leaked"
+            assert "evidence_cited" not in raw
+            assert "metadata" not in raw
+            assert "attempts" not in raw
+            assert "recipients" not in raw
+
+
+def test_the_call_projection_names_exactly_what_it_exposes() -> None:
+    with api_server() as base_url:
+        _, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "scenario": "confirmed", "now_utc": NEAR}
+        )
+
+        assert set(body["call"]) == {"placed", "provider_status", "result"}
+        assert set(body["call"]["result"]) <= {
+            "subject_intent", "answered_by", "confidence_note",
+            "manipulation_attempt_detected", "manipulation_attempt_note",
+        }
+        assert set(body["verdict"]) == {"status", "action"}
+        assert set(body) == {
+            "id", "state", "mode", "case", "evidence", "reasoning",
+            "call_decision", "compliance", "call", "verdict", "error",
+        }
+
+
+def test_a_compliance_reason_carrying_a_phone_number_is_masked() -> None:
+    """The blocked path is the one whose reason quotes the number being
+    dialled. It must still explain itself, without the digits.
+    """
+    with api_server() as base_url:
+        _, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "scenario": "blocked", "now_utc": NEAR}
+        )
+
+        reasons = [check["reason"] for check in body["compliance"]["checks"]]
+        joined = " ".join(reasons)
+        assert "+442079460123" not in joined
+        assert "no jurisdiction mapped" in joined, "the explanation must survive the masking"
+        assert "+...0123" in joined, "the number should be masked, not deleted"
+
+
+def test_the_reason_sanitizer_is_applied_to_every_engine_string() -> None:
+    """Checked directly, because the engine could grow another rule that
+    interpolates a number and no route-level test would notice.
+    """
+    from api.serialize import sanitize_reason
+
+    assert sanitize_reason("blocked for '+442079460123'") == "blocked for '+...0123'"
+    assert sanitize_reason("two: +12025550187 and +33639980000") == "two: +...0187 and +...0000"
+    assert sanitize_reason("no numbers here") == "no numbers here"
+
+
+def test_state_and_verdict_never_collapse_into_one_field() -> None:
+    with api_server() as base_url:
+        for body in _every_resolution_response(base_url):
+            assert body["state"] == "completed"
+            assert body["verdict"] is not None
+            assert body["state"] != body["verdict"]["status"]
+            # A transport state must never be an engine outcome.
+            assert body["state"] not in {
+                "RESOLVED", "RESOLVED_ALT", "UNRESOLVED_AMBIGUOUS",
+                "UNRESOLVED_CALL_BLOCKED", "NO_CALL_NEEDED",
+            }
+
+
+def test_the_serializer_invents_no_verdict_when_the_pipeline_produced_none() -> None:
+    """A dry run stops before a verdict exists. The API never runs one,
+    but the serializer must not paper over the case if it ever does.
+    """
+    import io
+    import contextlib as _contextlib
+
+    from api.serialize import resolution_payload
+    from client import parse_utc_timestamp
+    from pipeline import ResolutionRequest, resolve
+
+    from api.backend import FakeCallBackend
+
+    backend = FakeCallBackend()
+    backend.start()
+    try:
+        with _contextlib.redirect_stdout(io.StringIO()):
+            dry = resolve(
+                ResolutionRequest(
+                    case_path=str(CaseStore().path_for(HERO)),
+                    base_url=backend.base_url,
+                    execute=False,
+                    now_utc=parse_utc_timestamp(NEAR),
+                )
+            )
+    finally:
+        backend.stop()
+
+    assert dry.verdict is None
+    payload = resolution_payload(dry, "res_x", "completed", "fake")
+    assert payload["verdict"] is None
+    assert payload["call"]["placed"] is False

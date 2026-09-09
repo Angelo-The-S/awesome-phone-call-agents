@@ -19,7 +19,10 @@ reach outside cases/ regardless of what it contains.
 
 from __future__ import annotations
 
+import secrets
+from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 from evidence.model import Case, load_case
 
@@ -54,13 +57,73 @@ class CaseStore:
         """Served names that actually have a file, in allowlist order."""
         return tuple(name for name in self._served if (self._dir / f"{name}.json").is_file())
 
-    def get(self, name: str) -> Case:
+    def path_for(self, name: str) -> Path:
+        """The file backing a served case.
+
+        pipeline.ResolutionRequest takes a path, not a Case, so this is
+        the bridge - and it is the same allowlist check as get(), not a
+        looser one. A name is compared against the fixed tuple before it
+        is ever joined to a directory, so nothing a client sends can
+        address a file outside cases/ or a local fixture inside it.
+        """
         if name not in self._served:
             raise CaseNotFoundError(name)
         path = self._dir / f"{name}.json"
         if not path.is_file():
             raise CaseNotFoundError(name)
-        return load_case(path)
+        return path
+
+    def get(self, name: str) -> Case:
+        return load_case(self.path_for(name))
 
     def all(self) -> tuple[Case, ...]:
         return tuple(self.get(name) for name in self.names())
+
+
+class ResolutionNotFoundError(LookupError):
+    """Raised for an id this process did not issue, whether it never
+    existed or has been evicted. Indistinguishable on purpose: how full
+    the store is, and how long entries live, are not facts a client
+    should be able to probe.
+    """
+
+
+# Enough for a demo session; old entries fall off the front rather than
+# growing without bound. Resolutions are not persisted anywhere: this
+# process forgets everything when it stops, which is stated plainly
+# rather than worked around with a database nobody asked for.
+MAX_RESOLUTIONS = 200
+
+
+class ResolutionStore:
+    """In-memory, bounded, FIFO. Holds already-serialized payloads, not
+    Resolution objects: what a client can see is decided once, by
+    api/serialize.py, and never re-derived at read time.
+    """
+
+    def __init__(self, max_entries: int = MAX_RESOLUTIONS) -> None:
+        self._entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._max = max_entries
+
+    @staticmethod
+    def new_id() -> str:
+        """Opaque and random. Not a counter, not derived from the case,
+        the phone, the time, or anything else about the resolution - an
+        id that encoded any of those would leak them to whoever sees it.
+        """
+        return f"res_{secrets.token_urlsafe(12)}"
+
+    def put(self, resolution_id: str, payload: dict[str, Any]) -> None:
+        self._entries[resolution_id] = payload
+        self._entries.move_to_end(resolution_id)
+        while len(self._entries) > self._max:
+            self._entries.popitem(last=False)
+
+    def get(self, resolution_id: str) -> dict[str, Any]:
+        try:
+            return self._entries[resolution_id]
+        except KeyError:
+            raise ResolutionNotFoundError(resolution_id) from None
+
+    def __len__(self) -> int:
+        return len(self._entries)
