@@ -51,6 +51,25 @@ DRAIN_CHUNK_BYTES = 64 * 1024
 
 RESOLUTIONS_PATH = "/api/resolutions"
 
+# Upper bound on the polling loop of one HTTP-driven resolution.
+#
+# Calibrated from measurement rather than preference: the slowest observed
+# POST on the call-placing branch is 827 ms, under 16 concurrent requests
+# against the in-process fake backend (median 379 ms loaded, 40 ms not).
+# Ten seconds is roughly twelve times that worst case - room for a loaded
+# machine, while still releasing a wedged request thread promptly. It also
+# stays far below poll_until_terminal's 300 s warning threshold, so the
+# operator-facing "still watching" path never fires on this route.
+#
+# Honest limit: this bounds the polling loop, not a single hung HTTP
+# request. poll_until_terminal checks its deadline only between polls, and
+# CallEClient retries a GET up to MAX_ATTEMPTS times with a 30 s socket
+# timeout and 1+2+4 s of backoff, so one wedged socket can still cost
+# about two minutes on top of this. Bounding that would mean threading a
+# client timeout through ResolutionRequest - a change to pipeline.py this
+# does not justify. The ceiling is lowered here, not removed.
+MAX_POLL_SECONDS = 10.0
+
 # The four outcomes the fake backend can be steered to, and the only way
 # a client influences which number is dialled. It picks an outcome by
 # name; the number is chosen here, from fake_server.py's own reserved
@@ -302,6 +321,7 @@ class Handler(BaseHTTPRequestHandler):
             phone_override=SCENARIO_PHONES[scenario],
             now_utc=now_utc,
             poll_interval_seconds=0.01,
+            poll_timeout_seconds=MAX_POLL_SECONDS,
         )
 
         resolution_id = self.resolutions.new_id()

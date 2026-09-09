@@ -20,6 +20,7 @@ reach outside cases/ regardless of what it contains.
 from __future__ import annotations
 
 import secrets
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,14 @@ class ResolutionStore:
     def __init__(self, max_entries: int = MAX_RESOLUTIONS) -> None:
         self._entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._max = max_entries
+        # ThreadingHTTPServer has always run each request in its own
+        # thread, so this store has been shared from the day it was
+        # written. put() is three statements - insert, move to end, evict
+        # down to the cap - and while CPython's GIL makes each one atomic,
+        # the sequence is not. Nothing has been observed to break; this
+        # makes the compound operation actually indivisible instead of
+        # incidentally so, which is a guarantee rather than a bug fix.
+        self._lock = threading.Lock()
 
     @staticmethod
     def new_id() -> str:
@@ -114,16 +123,19 @@ class ResolutionStore:
         return f"res_{secrets.token_urlsafe(12)}"
 
     def put(self, resolution_id: str, payload: dict[str, Any]) -> None:
-        self._entries[resolution_id] = payload
-        self._entries.move_to_end(resolution_id)
-        while len(self._entries) > self._max:
-            self._entries.popitem(last=False)
+        with self._lock:
+            self._entries[resolution_id] = payload
+            self._entries.move_to_end(resolution_id)
+            while len(self._entries) > self._max:
+                self._entries.popitem(last=False)
 
     def get(self, resolution_id: str) -> dict[str, Any]:
-        try:
-            return self._entries[resolution_id]
-        except KeyError:
-            raise ResolutionNotFoundError(resolution_id) from None
+        with self._lock:
+            try:
+                return self._entries[resolution_id]
+            except KeyError:
+                raise ResolutionNotFoundError(resolution_id) from None
 
     def __len__(self) -> int:
-        return len(self._entries)
+        with self._lock:
+            return len(self._entries)

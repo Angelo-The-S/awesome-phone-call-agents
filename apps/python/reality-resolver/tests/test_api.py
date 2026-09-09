@@ -14,6 +14,7 @@ import json
 import re
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -954,3 +955,294 @@ def test_the_serializer_invents_no_verdict_when_the_pipeline_produced_none() -> 
     payload = resolution_payload(dry, "res_x", "completed", "fake")
     assert payload["verdict"] is None
     assert payload["call"]["placed"] is False
+
+
+# --- 3.6-b: ResolutionStore under concurrency ------------------------
+#
+# ThreadingHTTPServer has always given each request its own thread, so
+# this store was shared before it was locked. These use a Barrier rather
+# than sleeps, so the threads collide at a known instant instead of a
+# hoped-for one.
+#
+# Stated plainly: under CPython's GIL the unlocked version passes these
+# too. They assert that the invariants hold under concurrency; they do
+# not demonstrate a race that was observed. The lock makes put()'s three
+# statements indivisible rather than incidentally atomic.
+
+
+def test_concurrent_puts_never_exceed_the_cap_or_lose_the_store() -> None:
+    from api.store import ResolutionStore
+
+    store = ResolutionStore(max_entries=200)
+    threads_count, per_thread = 50, 20
+    barrier = threading.Barrier(threads_count)
+    failures: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            barrier.wait(timeout=10)
+            for _ in range(per_thread):
+                store.put(ResolutionStore.new_id(), {"payload": True})
+        except BaseException as exc:  # noqa: BLE001 - recorded, re-raised below
+            failures.append(exc)
+
+    workers = [threading.Thread(target=writer) for _ in range(threads_count)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=30)
+
+    assert not failures, f"a writer raised: {failures[0]!r}"
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(store) == 200, "the cap must hold exactly under 1000 concurrent puts"
+
+
+def test_readers_during_a_write_storm_never_see_a_broken_entry() -> None:
+    from api.store import ResolutionNotFoundError, ResolutionStore
+
+    store = ResolutionStore(max_entries=200)
+    pinned = ResolutionStore.new_id()
+    store.put(pinned, {"pinned": True})
+
+    stop = threading.Event()
+    failures: list[BaseException] = []
+    barrier = threading.Barrier(6)
+
+    def writer() -> None:
+        try:
+            barrier.wait(timeout=10)
+            while not stop.is_set():
+                store.put(ResolutionStore.new_id(), {"payload": True})
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+
+    def reader() -> None:
+        try:
+            barrier.wait(timeout=10)
+            while not stop.is_set():
+                try:
+                    entry = store.get(pinned)
+                except ResolutionNotFoundError:
+                    return  # legitimately evicted; nothing broken about that
+                assert entry == {"pinned": True}, "a reader saw a partial entry"
+                assert len(store) <= 200
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+
+    workers = [threading.Thread(target=writer) for _ in range(3)]
+    workers += [threading.Thread(target=reader) for _ in range(3)]
+    for worker in workers:
+        worker.start()
+    time.sleep(0.25)
+    stop.set()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert not failures, f"a worker raised: {failures[0]!r}"
+    assert len(store) <= 200
+
+
+def test_fifo_eviction_order_is_unchanged_by_the_lock() -> None:
+    """The single-threaded guarantee still holds exactly: oldest out
+    first, cap respected, survivors readable.
+    """
+    from api.store import ResolutionNotFoundError, ResolutionStore
+
+    store = ResolutionStore(max_entries=3)
+    ids = [ResolutionStore.new_id() for _ in range(5)]
+    for index, rid in enumerate(ids):
+        store.put(rid, {"n": index})
+
+    assert len(store) == 3
+    for evicted in ids[:2]:
+        with pytest.raises(ResolutionNotFoundError):
+            store.get(evicted)
+    assert [store.get(rid)["n"] for rid in ids[2:]] == [2, 3, 4]
+
+
+def test_forty_concurrent_posts_stay_consistent_over_http() -> None:
+    """The same guarantee through the real server, which is where the
+    threads actually come from.
+    """
+    with api_server_and_backend() as (base_url, backend):
+        barrier = threading.Barrier(40)
+        results: list[tuple[int, str]] = []
+        lock = threading.Lock()
+
+        def worker(index: int) -> None:
+            scenario = ("confirmed", "cancelled", "voicemail")[index % 3]
+            barrier.wait(timeout=20)
+            status, body, _ = post(
+                base_url,
+                "/api/resolutions",
+                {"case": HERO, "scenario": scenario, "now_utc": NEAR},
+            )
+            with lock:
+                results.append((status, body["id"]))
+
+        workers = [threading.Thread(target=worker, args=(i,)) for i in range(40)]
+        for worker_thread in workers:
+            worker_thread.start()
+        for worker_thread in workers:
+            worker_thread.join(timeout=60)
+
+        assert len(results) == 40, "every concurrent POST must have answered"
+        assert all(status == 201 for status, _ in results), "the 201 contract holds under load"
+        ids = [rid for _, rid in results]
+        assert len(set(ids)) == 40, "ids collided under concurrency"
+        assert backend.creates == 40
+
+        # Every one of them is still readable through its own id.
+        for rid in ids[-10:]:
+            status, fetched, _ = request(base_url, f"/api/resolutions/{rid}")
+            assert status == 200
+            assert fetched["id"] == rid
+
+
+# --- 3.6-a: the polling loop is bounded ------------------------------
+
+
+@contextmanager
+def wedged_provider(poll_seconds: float = 0.05) -> Iterator[None]:
+    """Make the provider look permanently in progress, and shorten the
+    poll bound so the test is quick.
+
+    Injected at CallEClient.get_call, which is exactly what
+    poll_until_terminal loops on - so the loop under test runs for real,
+    against a real fake backend, with nothing slowed down and
+    fake_server.py untouched. A status outside TERMINAL_STATUSES simply
+    never ends the loop, which is the condition the bound exists for.
+
+    Restores both attributes itself rather than leaning on pytest's
+    monkeypatch fixture, which unwinds at the end of the test and not at
+    the end of a with block - the difference matters here, because these
+    tests need the provider working again afterwards.
+    """
+    import api.server as server_module
+    from client import CallEClient
+
+    original_get_call = CallEClient.get_call
+    original_bound = server_module.MAX_POLL_SECONDS
+    CallEClient.get_call = lambda self, call_id: {"id": call_id, "status": "in_progress"}  # type: ignore[method-assign]
+    server_module.MAX_POLL_SECONDS = poll_seconds
+    try:
+        yield
+    finally:
+        CallEClient.get_call = original_get_call  # type: ignore[method-assign]
+        server_module.MAX_POLL_SECONDS = original_bound
+
+
+def test_a_call_that_never_terminates_fails_technically_without_a_verdict() -> None:
+    with api_server_and_backend() as (base_url, backend):
+        with wedged_provider():
+            started = time.monotonic()
+            status, body, _ = post(
+                base_url,
+                "/api/resolutions",
+                {"case": HERO, "scenario": "confirmed", "now_utc": NEAR},
+            )
+            elapsed = time.monotonic() - started
+
+        assert status == 502
+        assert body["error"]["code"] == "resolution_failed"
+
+        # A technical failure is a technical failure. No verdict is
+        # invented, and nothing in the reply can be read as one.
+        raw = json.dumps(body)
+        assert "verdict" not in body
+        for forbidden in (
+            "RESOLVED", "RESOLVED_ALT", "CANCELLED", "UNRESOLVED_AMBIGUOUS",
+            "REASSIGN_TECHNICIAN", "CONTINUE_DISPATCH", "HUMAN_REVIEW",
+        ):
+            assert forbidden not in raw, f"{forbidden} appeared in a technical failure"
+        assert "Traceback" not in raw
+        assert set(body) == {"error"}
+
+        # The request returned instead of pinning a worker thread forever.
+        assert elapsed < 5.0, f"the request took {elapsed:.1f}s; the poll bound did not fire"
+        assert backend.creates == 1, "the call was created; only its completion never came"
+
+
+def test_a_timed_out_resolution_is_not_stored() -> None:
+    from api.backend import FakeCallBackend
+    from api.server import create_server
+    from api.store import ResolutionStore
+
+    backend = FakeCallBackend()
+    backend.start()
+    resolutions = ResolutionStore()
+    server = create_server("127.0.0.1", 0, backend=backend, resolutions=resolutions)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.0005}, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    base_url = f"http://{host}:{port}"
+    try:
+        assert len(resolutions) == 0
+        with wedged_provider():
+            status, _, _ = post(
+                base_url, "/api/resolutions", {"case": HERO, "scenario": "confirmed", "now_utc": NEAR}
+            )
+        assert status == 502
+        assert len(resolutions) == 0, "a failed run must leave nothing behind"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        backend.stop()
+
+
+def test_the_server_still_works_after_a_timeout() -> None:
+    """A wedged poll must not wedge the server: the next request has to
+    behave as if nothing happened.
+    """
+    threads_before = threading.active_count()
+
+    with api_server_and_backend() as (base_url, _):
+        with wedged_provider():
+            assert post(base_url, "/api/resolutions", {"case": HERO, "now_utc": NEAR})[0] == 502
+
+        # The context restored both the provider and the real bound, so
+        # this second run is the ordinary path again.
+        status, body, _ = post(
+            base_url, "/api/resolutions", {"case": HERO, "scenario": "confirmed", "now_utc": NEAR}
+        )
+        assert status == 201
+        assert body["verdict"] == {"status": "RESOLVED", "action": "CONTINUE_DISPATCH"}
+        assert request(base_url, "/api/health")[0] == 200
+
+    deadline = time.monotonic() + 5
+    while threading.active_count() > threads_before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert threading.active_count() <= threads_before, "a request thread was left running"
+
+
+def test_the_poll_bound_is_armed_on_the_http_path() -> None:
+    """The constant exists and is actually handed to the pipeline. A
+    bound nobody passes is not a bound.
+    """
+    from api.server import MAX_POLL_SECONDS
+
+    assert MAX_POLL_SECONDS == 10.0
+    source = Path(__import__("api.server", fromlist=["x"]).__file__).read_text(encoding="utf-8")
+    assert "poll_timeout_seconds=MAX_POLL_SECONDS" in source
+
+
+def test_the_normal_branches_are_unaffected_by_the_bound() -> None:
+    """Ten seconds is orders of magnitude above what any branch needs, so
+    none of them should come near it.
+    """
+    with api_server() as base_url:
+        for scenario, expected in (
+            ("confirmed", "RESOLVED"),
+            ("cancelled", "RESOLVED_ALT"),
+            ("voicemail", "UNRESOLVED_AMBIGUOUS"),
+            ("blocked", "UNRESOLVED_CALL_BLOCKED"),
+        ):
+            started = time.monotonic()
+            status, body, _ = post(
+                base_url, "/api/resolutions", {"case": HERO, "scenario": scenario, "now_utc": NEAR}
+            )
+            elapsed = time.monotonic() - started
+            assert status == 201
+            assert body["verdict"]["status"] == expected
+            assert elapsed < 5.0, f"{scenario} took {elapsed:.1f}s, uncomfortably close to the bound"
