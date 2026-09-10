@@ -58,7 +58,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
 from compliance.models import PreCallDecision
 
@@ -316,18 +316,41 @@ def require_api_key() -> str:
     return api_key
 
 
-def resolve_api_key(args: argparse.Namespace) -> str:
-    """Only read/require the real CALLE_API_KEY when all three are true:
-    --execute, --allow-live, and base_url is the real API. Every other
-    path (dry-run, or --execute against a non-real base_url) uses a
-    hardcoded, obviously-fake key and never touches the environment
-    variable at all - so the fake server can never receive a real
-    credential, even if CALLE_API_KEY happens to be set in the caller's
-    shell.
+class ApiKeyContext(Protocol):
+    """The four attributes resolve_api_key() reads.
+
+    Spelled out as a Protocol rather than typed as the concrete request
+    object, because pipeline.ResolutionRequest imports this module and
+    the reverse would be circular. It replaces an argparse.Namespace
+    annotation that stopped being accurate once the pipeline was
+    extracted and became this function's only caller.
     """
-    live_target = args.base_url.rstrip("/") == REAL_API_BASE_URL.rstrip("/")
-    if args.execute and live_target and args.allow_live:
-        return require_api_key()
+
+    base_url: str
+    execute: bool
+    allow_live: bool
+    api_key: str | None
+
+
+def resolve_api_key(request: ApiKeyContext) -> str:
+    """Only use a real credential when all three are true: execute,
+    allow_live, and base_url is the real API. Every other path (dry-run,
+    or execute against a non-real base_url) uses a hardcoded,
+    obviously-fake key and never touches the environment variable at all
+    - so the fake server can never receive a real credential, even if
+    CALLE_API_KEY happens to be set in the caller's shell, and even if
+    the caller supplied a per-request key.
+
+    On the live path, a per-request request.api_key wins over the
+    environment. That is what lets one process serve several resolutions
+    with different credentials without writing to os.environ - shared
+    mutable state through which two concurrent runs could swap keys. An
+    unset or empty value falls back to CALLE_API_KEY, which is exactly
+    the CLI's behaviour and the only behaviour before this existed.
+    """
+    live_target = request.base_url.rstrip("/") == REAL_API_BASE_URL.rstrip("/")
+    if request.execute and live_target and request.allow_live:
+        return request.api_key or require_api_key()
     return FAKE_DEV_API_KEY
 
 

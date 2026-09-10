@@ -194,20 +194,24 @@ ALLOWED_RESULT_KEYS = (
 )
 
 
-def call_payload(resolution: Resolution) -> dict[str, Any]:
+def call_projection(call: dict[str, Any] | None, placed: bool) -> dict[str, Any]:
     """Three facts and the structured result. Nothing else from the
     provider response crosses this line.
 
-    Resolution.call is the raw object: it carries the recipient's number
+    `call` is the raw provider object: it carries the recipient's number
     in the clear, every transcript turn, the 3.6k-character hardened
     task (which embeds the case's call_task_hint), per-attempt provider
     ids, and free-text summaries. None of that is projected here, and
     the omission is enforced by naming what is included rather than by
     listing what is not - a field added upstream is excluded by default.
+
+    Takes the raw object rather than a Resolution so that a caller
+    holding only a partial view - a call in progress, say - projects it
+    through this same allowlist instead of a second copy of it. Two
+    copies of a security boundary can drift; one cannot.
     """
-    call = resolution.call
     if call is None:
-        return {"placed": resolution.call_placed, "provider_status": None, "result": None}
+        return {"placed": placed, "provider_status": None, "result": None}
 
     raw_result = call.get("structured_result") or {}
     result = {
@@ -217,12 +221,35 @@ def call_payload(resolution: Resolution) -> dict[str, Any]:
     } or None
 
     return {
-        "placed": resolution.call_placed,
+        "placed": placed,
         "provider_status": _text(str(call.get("status")), MAX_IDENTIFIER_CHARS)
         if call.get("status") is not None
         else None,
         "result": result,
     }
+
+
+def call_payload(resolution: Resolution) -> dict[str, Any]:
+    return call_projection(resolution.call, resolution.call_placed)
+
+
+def case_summary(case: Case) -> dict[str, Any]:
+    """The three case fields a resolution carries, as opposed to the
+    fuller catalog entry case_metadata() builds. No phone number here at
+    all, masked or otherwise: a resolution never needs one.
+    """
+    return {
+        "name": _text(case.name),
+        "use_case": _text(case.use_case),
+        "decision_options": {str(k): _text(str(v)) for k, v in case.decision_options.items()},
+    }
+
+
+def call_decision_label(reasoning: ReasoningResult) -> str:
+    """A label for the engine's own boolean, and only that. It restates
+    decision_critical; it never recomputes it.
+    """
+    return "CALL_JUSTIFIED" if reasoning.decision_critical else "NO_CALL_NEEDED"
 
 
 def verdict_payload(verdict: Verdict | None) -> dict[str, Any] | None:
@@ -260,16 +287,10 @@ def resolution_payload(
         "id": _text(resolution_id, MAX_IDENTIFIER_CHARS),
         "state": _text(state, MAX_IDENTIFIER_CHARS),
         "mode": _text(mode, MAX_IDENTIFIER_CHARS),
-        "case": {
-            "name": _text(resolution.case.name),
-            "use_case": _text(resolution.case.use_case),
-            "decision_options": {
-                str(k): _text(str(v)) for k, v in resolution.case.decision_options.items()
-            },
-        },
+        "case": case_summary(resolution.case),
         "evidence": [evidence_item(item) for item in resolution.case.evidence.items],
         "reasoning": reasoning_payload(resolution.reasoning),
-        "call_decision": "CALL_JUSTIFIED" if resolution.reasoning.decision_critical else "NO_CALL_NEEDED",
+        "call_decision": call_decision_label(resolution.reasoning),
         "compliance": compliance_payload(
             resolution.compliance,
             resolution.applicable_compliance,
