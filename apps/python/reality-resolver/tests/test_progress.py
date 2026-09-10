@@ -92,6 +92,38 @@ def test_update_replaces_a_key_whole_rather_than_merging_into_it() -> None:
     }
 
 
+def test_a_snapshot_already_returned_never_changes_under_its_reader() -> None:
+    """get() hands out a copy, and this is the invariant that requires it.
+
+    A reader holds its result while it serializes it; a worker keeps
+    calling update() on the same resolution. If get() returned the live
+    entry, the reader would be looking at a payload that shifts under it -
+    half one state, half the next. So the object it already has must stay
+    exactly as it was, no matter what happens to the entry afterwards.
+    """
+    store, rid = _seeded_store()
+    store.update(rid, {"state": "running", "verdict": None})
+
+    snapshot = store.get(rid)
+    assert snapshot["state"] == "running"
+
+    # Everything a running resolution goes on to publish.
+    store.update(rid, {"reasoning": {"decision_critical": True}})
+    store.update(rid, {"call": {"placed": True, "provider_status": "completed", "result": None}})
+    store.update(rid, {"state": "completed", "verdict": {"status": "RESOLVED", "action": "GO"}})
+
+    assert snapshot["state"] == "running", "the snapshot followed the entry"
+    assert snapshot["verdict"] is None
+    assert "reasoning" not in snapshot
+    assert "call" not in snapshot
+    assert snapshot is not store.get(rid), "each read must be its own snapshot"
+    assert store.get(rid)["state"] == "completed", "the entry itself did move on"
+
+    # And writing into a snapshot cannot write back into the store.
+    snapshot["state"] = "tampered"
+    assert store.get(rid)["state"] == "completed"
+
+
 def test_update_on_an_unknown_id_raises_like_get() -> None:
     store, _ = _seeded_store()
 

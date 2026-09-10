@@ -36,7 +36,7 @@ from api.serialize import (
     reasoning_payload,
     verdict_payload,
 )
-from api.store import ResolutionStore
+from api.store import ResolutionNotFoundError, ResolutionStore
 from compliance.models import PreCallDecision
 from evidence.engine import ReasoningResult
 from evidence.model import Case
@@ -68,7 +68,24 @@ class StoreObserver(Observer):
         self._next_legal_window: str | None = None
 
     def _publish(self, patch: dict[str, Any]) -> None:
-        self._store.update(self._id, patch)
+        """Best-effort. The store is a volatile projection; the pipeline
+        is the source of truth.
+
+        An entry can be evicted while its resolution is still running -
+        the store is bounded and FIFO, and updating does not refresh an
+        entry's position. Losing the projection is a publication problem,
+        not a reason to abort the work, and letting it propagate would do
+        exactly that: pipeline.resolve() wraps no observer call, so an
+        exception raised here kills the resolution mid-flight.
+
+        Only that one exception is swallowed. Anything else raised in
+        here is a real fault in this class, and hiding it would turn a
+        bug into silence.
+        """
+        try:
+            self._store.update(self._id, patch)
+        except ResolutionNotFoundError:
+            return
 
     def _publish_compliance(self) -> None:
         self._publish(

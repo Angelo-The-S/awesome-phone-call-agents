@@ -158,9 +158,19 @@ class ResolutionStore:
             entry.update(patch)
 
     def get(self, resolution_id: str) -> dict[str, Any]:
+        """A consistent snapshot, not the live entry.
+
+        The copy is the point. A resolution running on a worker keeps
+        calling update() on its entry, so handing out the stored dict
+        would let a reader serialize it while it changes underneath -
+        producing a payload that is half one state and half the next.
+        Taken under the lock, a shallow copy is enough: update() replaces
+        whole top-level values and never edits a nested object in place,
+        so the references captured here cannot shift afterwards.
+        """
         with self._lock:
             try:
-                return self._entries[resolution_id]
+                return dict(self._entries[resolution_id])
             except KeyError:
                 raise ResolutionNotFoundError(resolution_id) from None
 

@@ -4,28 +4,36 @@ No framework: this app already serves HTTP with http.server in
 fake_server.py, four endpoints do not justify a dependency tree, and
 CONTRIBUTING asks contributions to install without one.
 
-Scope of this file today, stated so the boundary is checkable rather
-than assumed: it imports the case store and the serializers, and nothing
-else from the app. It does not import pipeline, client, or any CALL-E
-code path; it cannot place a call, cannot start a resolution, and needs
-no credential to run. Importing this module starts nothing - the server
-is created by create_server() and run by main().
+Scope of this file, stated so the boundary is checkable rather than
+assumed: it validates input, seeds an entry, hands the run to
+pipeline.resolve() on a worker, and serves what the store holds. It
+scores no rule, builds no compliance context, reconciles nothing and
+constructs no provider client - resolve() is the only caller of any of
+those, here as in the CLI, and a test scans this file to keep it that
+way. It needs no credential to run and can place no real call.
+
+Importing this module starts nothing: the server is created by
+create_server(), the fake backend and the worker pool are started and
+stopped by whoever creates them, and main() does all three in order.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
 from api.backend import FakeCallBackend
-from api.serialize import cases_payload, error_payload, health_payload, resolution_payload
+from api.progress import StoreObserver
+from api.serialize import case_summary, cases_payload, error_payload, health_payload
 from api.store import CaseNotFoundError, CaseStore, ResolutionNotFoundError, ResolutionStore
-from client import CallEAPIError, parse_utc_timestamp
+from client import parse_utc_timestamp
+from evidence.model import Case
 from fake_server import SUBJECT_CANCELLED_PHONE, SUBJECT_VOICEMAIL_PHONE
-from pipeline import ResolutionRefused, ResolutionRequest, resolve
+from pipeline import ResolutionRequest, resolve
 
 # Loopback by default and on purpose. This server has no authentication,
 # so binding it to every interface would be a decision an operator makes
@@ -90,7 +98,117 @@ DEFAULT_SCENARIO = "confirmed"
 # client trying to reach a knob this API does not expose - base_url,
 # execute, allow_live, authorize_destination, phone - and is refused
 # rather than ignored, so a mistaken client hears about it.
-RESOLUTION_REQUEST_FIELDS = frozenset({"case", "scenario", "now_utc"})
+RESOLUTION_REQUEST_FIELDS = frozenset({"case", "execution_mode", "scenario", "now_utc"})
+
+# Execution backends this build can actually drive. "live" is a value the
+# architecture recognises and this build does not implement, which is why
+# it answers 501 rather than 422: the request is well formed, the server
+# just cannot do it. Answering 422 would tell a client the value is wrong,
+# and silently accepting it would claim a capability that does not exist.
+IMPLEMENTED_EXECUTION_MODES = frozenset({"fake"})
+KNOWN_EXECUTION_MODES = IMPLEMENTED_EXECUTION_MODES | {"live"}
+
+# Resolutions run on a small pool rather than on the request thread.
+# Four is not about throughput - a fake resolution takes about 25 ms -
+# it is a bound. ThreadingHTTPServer already spawns one thread per
+# connection without a ceiling; adding unbounded workers on top would
+# double that problem. A saturated pool queues, which is honest here:
+# `queued` is a real state the client can see.
+MAX_WORKERS = 4
+
+# How many connections the OS may hold waiting to be accepted.
+#
+# socketserver's default is 5, which ThreadingHTTPServer inherits. That
+# was survivable while a POST did all its work inline and clients
+# arrived spread out; now that accepting is nearly instant, a client
+# can burst - and a burst of 40 simultaneous connections had five of
+# them refused by the kernel before this server ever saw them. Measured,
+# not theorised: it made a concurrency test fail roughly one run in
+# three. This is the accept queue, not a concurrency limit; work is
+# still bounded by MAX_WORKERS.
+REQUEST_QUEUE_SIZE = 64
+
+
+class ResolverHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a backlog that survives a burst."""
+
+    request_queue_size = REQUEST_QUEUE_SIZE
+
+
+def queued_entry(resolution_id: str, case: Case, mode: str) -> dict[str, Any]:
+    """The entry a resolution starts life as: every key of the public
+    contract present, and everything not yet known set to null.
+
+    The nulls are the job's own seed, not something StoreObserver
+    invented - it still publishes a field only once the pipeline has made
+    it true. What this buys is a stable shape from the very first
+    response, so a client is never reading a payload whose keys appear
+    one at a time.
+
+    The key set is asserted against resolution_payload's in the tests:
+    two places build this contract, and they must not drift.
+    """
+    return {
+        "id": resolution_id,
+        "state": "queued",
+        "mode": mode,
+        "case": case_summary(case),
+        "evidence": None,
+        "reasoning": None,
+        "call_decision": None,
+        "compliance": None,
+        # An object rather than null, unlike the fields above, because
+        # this one is already known: nothing has been placed yet, and
+        # `placed: false` says so. It also keeps the shape identical to
+        # what resolution_payload produces on the branches that never
+        # call - a client reading call.placed must not have to check
+        # whether `call` is an object first.
+        "call": {"placed": False, "provider_status": None, "result": None},
+        "verdict": None,
+        "error": None,
+    }
+
+
+def _run_resolution(
+    resolutions: ResolutionStore, resolution_id: str, request: ResolutionRequest
+) -> None:
+    """Run one resolution to completion, off the request thread.
+
+    Module-level rather than a Handler method on purpose: by the time
+    this runs, the request that started it has been answered and its
+    handler is gone.
+
+    It decides nothing. resolve() is called exactly as the CLI calls it,
+    with a StoreObserver attached; the only thing added here is turning
+    an exception into a transport state. Every exception becomes
+    `failed` with a null verdict - a technical failure is never an engine
+    outcome, so a timeout, a provider error or a bug cannot surface as a
+    cancellation. BaseException is deliberately not caught: a
+    KeyboardInterrupt or a SystemExit is the interpreter going down, not
+    a resolution failing.
+
+    The reply carries this module's own text, never str(exc): provider
+    error bodies and pipeline messages can quote back a number, a task,
+    or an input, and none of that belongs in a stored payload.
+    """
+    try:
+        resolve(request, StoreObserver(resolutions, resolution_id))
+    except Exception:
+        try:
+            resolutions.update(
+                resolution_id,
+                {
+                    "state": "failed",
+                    "verdict": None,
+                    "error": {
+                        "code": "resolution_failed",
+                        "message": "the resolution could not be completed",
+                    },
+                },
+            )
+        except ResolutionNotFoundError:
+            # Evicted while running; there is nothing left to mark.
+            return
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -107,6 +225,10 @@ class Handler(BaseHTTPRequestHandler):
     @property
     def backend(self) -> FakeCallBackend:
         return self.server.backend  # type: ignore[attr-defined]
+
+    @property
+    def executor(self) -> ThreadPoolExecutor:
+        return self.server.executor  # type: ignore[attr-defined]
 
     def log_message(self, *args: Any) -> None:
         """Silent, same as fake_server.py. The default writes the request
@@ -252,14 +374,13 @@ class Handler(BaseHTTPRequestHandler):
         return 200, cases_payload(self.store.all())
 
     def handle_create_resolution(self) -> tuple[int, dict[str, Any]]:
-        """Validate, hand the whole run to pipeline.resolve(), serialize
-        what came back.
+        """Validate, seed an entry, hand the run to a worker, answer 202.
 
         This method makes no decision about the case. It does not score
         R1-R4, build a PreCallContext, run or filter compliance checks,
         or reconcile anything - resolve() is the only caller of any of
         those, here as in the CLI. Everything below is either input
-        validation or translation.
+        validation, transport, or handing work to _run_resolution.
         """
         try:
             payload = json.loads(self.body or b"")
@@ -275,6 +396,20 @@ class Handler(BaseHTTPRequestHandler):
             # steer, and silently ignoring it would hide that.
             return 422, error_payload(
                 "unknown_field", f"this endpoint accepts only {sorted(RESOLUTION_REQUEST_FIELDS)}"
+            )
+
+        # Checked before anything else about the case, because a mode
+        # this build cannot drive makes the rest moot.
+        execution_mode = payload.get("execution_mode")
+        if execution_mode not in KNOWN_EXECUTION_MODES:
+            return 422, error_payload(
+                "invalid_execution_mode",
+                f"execution_mode is required and must be one of {sorted(KNOWN_EXECUTION_MODES)}",
+            )
+        if execution_mode not in IMPLEMENTED_EXECUTION_MODES:
+            return 501, error_payload(
+                "live_not_available",
+                "live execution is not available in this build; no real call can be placed",
             )
 
         case_name = payload.get("case")
@@ -303,6 +438,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             case_path = self.store.path_for(case_name)
+            case = self.store.get(case_name)
         except CaseNotFoundError:
             return 404, error_payload("case_not_found", "no such case")
 
@@ -325,17 +461,20 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         resolution_id = self.resolutions.new_id()
-        try:
-            resolution = resolve(request)
-        except (CallEAPIError, TimeoutError, RuntimeError, ResolutionRefused):
-            # A technical failure, and it stays one: no Resolution means
-            # no verdict, and the client is told the run failed rather
-            # than handed an outcome nobody computed.
-            return 502, error_payload("resolution_failed", "the resolution could not be completed")
+        seed = queued_entry(resolution_id, case, MODE)
 
-        body = resolution_payload(resolution, resolution_id, "completed", MODE)
-        self.resolutions.put(resolution_id, body)
-        return 201, body
+        # Seeded before the work is submitted, never after. The observer
+        # publishes through store.update(), which requires the entry to
+        # exist; a worker that started first could reach on_start before
+        # this line ran and lose the whole run's progress.
+        #
+        # The store gets a copy, and this reply keeps its own. Handing
+        # over the same object would leave the response being serialized
+        # while a worker mutates it - a 202 that sometimes says "running",
+        # or worse, a torn mixture of two states.
+        self.resolutions.put(resolution_id, dict(seed))
+        self.executor.submit(_run_resolution, self.resolutions, resolution_id, request)
+        return 202, seed
 
     def handle_get_resolution(self, resolution_id: str) -> tuple[int, dict[str, Any]]:
         try:
@@ -357,19 +496,32 @@ def create_server(
     store: CaseStore | None = None,
     backend: FakeCallBackend | None = None,
     resolutions: ResolutionStore | None = None,
-) -> ThreadingHTTPServer:
+    executor: ThreadPoolExecutor | None = None,
+) -> ResolverHTTPServer:
     """Build a server without starting it, and without starting the
     backend either.
 
-    The two lifecycles stay separate deliberately: whoever starts the
-    fake backend stops it. Wiring its start into this function would
-    make a forgotten stop invisible, and would tie a listener nobody
-    named to the lifetime of an HTTP server that may outlive it.
+    The lifecycles stay separate deliberately: whoever starts the fake
+    backend stops it, and whoever submits work to the executor shuts it
+    down. Wiring either into this function would make a forgotten
+    teardown invisible, and would tie threads nobody named to the
+    lifetime of an HTTP server that may outlive them. A default executor
+    is built for convenience; a caller that actually submits resolutions
+    should own one and shut it down.
     """
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.store = store or CaseStore()  # type: ignore[attr-defined]
-    server.backend = backend or FakeCallBackend()  # type: ignore[attr-defined]
-    server.resolutions = resolutions or ResolutionStore()  # type: ignore[attr-defined]
+    server = ResolverHTTPServer((host, port), Handler)
+    # `is None` rather than `or`, and not as a style preference:
+    # ResolutionStore defines __len__, so an empty one is falsy and
+    # `resolutions or ResolutionStore()` silently threw away the store a
+    # caller had passed in. Anything given here is used, empty or not.
+    server.store = store if store is not None else CaseStore()  # type: ignore[attr-defined]
+    server.backend = backend if backend is not None else FakeCallBackend()  # type: ignore[attr-defined]
+    server.resolutions = (  # type: ignore[attr-defined]
+        resolutions if resolutions is not None else ResolutionStore()
+    )
+    server.executor = (  # type: ignore[attr-defined]
+        executor if executor is not None else ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    )
     return server
 
 
@@ -384,7 +536,8 @@ def main(argv: list[str] | None = None) -> int:
 
     backend = FakeCallBackend()
     backend.start()
-    server = create_server(args.host, args.port, backend=backend)
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    server = create_server(args.host, args.port, backend=backend, executor=executor)
     host, port = server.server_address[:2]
     print(f"Reality Resolver API on http://{host}:{port} (mode={MODE}, no real call can be placed)", flush=True)
     try:
@@ -392,7 +545,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nStopped.", flush=True)
     finally:
+        # Order matters. Stop accepting, let in-flight resolutions finish,
+        # and only then take the backend away - a worker still polling
+        # would otherwise find its provider gone mid-run. MAX_POLL_SECONDS
+        # is what makes wait=True safe: it bounds how long a resolution
+        # can hold the shutdown, and these are not daemon threads.
         server.server_close()
+        executor.shutdown(wait=True)
         backend.stop()
     return 0
 
