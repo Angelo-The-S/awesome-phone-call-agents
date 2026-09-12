@@ -1,4 +1,4 @@
-"""Read-only HTTP surface over the case catalog, on the standard library.
+"""HTTP surface over the case catalog and resolutions, on the standard library.
 
 No framework: this app already serves HTTP with http.server in
 fake_server.py, four endpoints do not justify a dependency tree, and
@@ -10,7 +10,8 @@ pipeline.resolve() on a worker, and serves what the store holds. It
 scores no rule, builds no compliance context, reconciles nothing and
 constructs no provider client - resolve() is the only caller of any of
 those, here as in the CLI, and a test scans this file to keep it that
-way. It needs no credential to run and can place no real call.
+way. Live execution requires an explicit per-request credential and
+destination authorization.
 
 Importing this module starts nothing: the server is created by
 create_server(), the fake backend and the worker pool are started and
@@ -21,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -30,10 +33,15 @@ from api.backend import FakeCallBackend
 from api.progress import StoreObserver
 from api.serialize import case_summary, cases_payload, error_payload, health_payload
 from api.store import CaseNotFoundError, CaseStore, ResolutionNotFoundError, ResolutionStore
-from client import parse_utc_timestamp
+from client import (
+    CallEAPIError,
+    REAL_API_BASE_URL,
+    build_recipient,
+    parse_utc_timestamp,
+)
 from evidence.model import Case
 from fake_server import SUBJECT_CANCELLED_PHONE, SUBJECT_VOICEMAIL_PHONE
-from pipeline import ResolutionRequest, resolve
+from pipeline import ProviderCallFailedError, ResolutionRequest, resolve
 
 # Loopback by default and on purpose. This server has no authentication,
 # so binding it to every interface would be a decision an operator makes
@@ -45,11 +53,10 @@ DEFAULT_PORT = 8000
 # engine answered; it is not a build identifier and carries no path.
 ENGINE_VERSION = "0.0.0"
 
-# There is no live mode to report yet: nothing in this server can reach a
-# provider, so anything other than "fake" would be a claim the code does
-# not back. The configuration seam belongs with the phase that can
-# actually place a call.
-MODE = "fake"
+# The server can run either the local fake backend or the explicitly
+# authorized live CALL-E path. Resolution entries carry their selected
+# mode; health reports the capability set.
+MODE = "mixed"
 
 # Largest declared request body this server will read and discard before
 # giving up on reusing the connection. No route reads input, so this only
@@ -78,15 +85,15 @@ RESOLUTIONS_PATH = "/api/resolutions"
 # does not justify. The ceiling is lowered here, not removed.
 MAX_POLL_SECONDS = 10.0
 
-# The four outcomes the fake backend can be steered to, and the only way
-# a client influences which number is dialled. It picks an outcome by
-# name; the number is chosen here, from fake_server.py's own reserved
-# sentinels and Ofcom's reserved drama range. A client never sends a
-# phone number, so there is no request shape that reaches an arbitrary
-# one - and "blocked" is not a bypass in the other direction either: it
-# routes to a number with no jurisdiction mapping, and the hard gate
-# refuses it for real.
+# The fake scenarios, including the no-call clock preset, and the only way
+# a fake request influences which number is dialled. It picks an outcome
+# by name; the number is chosen here, from fake_server.py's own reserved
+# sentinels and Ofcom's reserved drama range. Live requests use their
+# separately validated destination, and "blocked" is not a bypass in the
+# fake path either: it routes to a number with no jurisdiction mapping,
+# and the hard gate refuses it for real.
 SCENARIO_PHONES: dict[str, str | None] = {
+    "no-call": None,  # the fake clock places the deadline outside R4's threshold
     "confirmed": None,  # the case file's own number: fake server's happy path
     "cancelled": SUBJECT_CANCELLED_PHONE,
     "voicemail": SUBJECT_VOICEMAIL_PHONE,
@@ -94,19 +101,19 @@ SCENARIO_PHONES: dict[str, str | None] = {
 }
 DEFAULT_SCENARIO = "confirmed"
 
-# Exactly the keys a resolution request may carry. Anything else is a
-# client trying to reach a knob this API does not expose - base_url,
-# execute, allow_live, authorize_destination, phone - and is refused
-# rather than ignored, so a mistaken client hears about it.
-RESOLUTION_REQUEST_FIELDS = frozenset({"case", "execution_mode", "scenario", "now_utc"})
+# The HTTP contract is split by execution mode. Values from the other
+# mode are rejected explicitly instead of being silently ignored.
+FAKE_REQUEST_FIELDS = frozenset({"case", "execution_mode", "scenario", "now_utc"})
+LIVE_REQUEST_FIELDS = frozenset(
+    {"case", "execution_mode", "destination", "authorize_destination", "gdpr_basis_documented"}
+)
+RESOLUTION_REQUEST_FIELDS = FAKE_REQUEST_FIELDS | LIVE_REQUEST_FIELDS
 
-# Execution backends this build can actually drive. "live" is a value the
-# architecture recognises and this build does not implement, which is why
-# it answers 501 rather than 422: the request is well formed, the server
-# just cannot do it. Answering 422 would tell a client the value is wrong,
-# and silently accepting it would claim a capability that does not exist.
-IMPLEMENTED_EXECUTION_MODES = frozenset({"fake"})
-KNOWN_EXECUTION_MODES = IMPLEMENTED_EXECUTION_MODES | {"live"}
+# Execution backends this build can actually drive. Both modes share the
+# same pipeline; the live branch is guarded by explicit authorization and
+# a process-local concurrency limit.
+IMPLEMENTED_EXECUTION_MODES = frozenset({"fake", "live"})
+KNOWN_EXECUTION_MODES = IMPLEMENTED_EXECUTION_MODES
 
 # Resolutions run on a small pool rather than on the request thread.
 # Four is not about throughput - a fake resolution takes about 25 ms -
@@ -115,6 +122,9 @@ KNOWN_EXECUTION_MODES = IMPLEMENTED_EXECUTION_MODES | {"live"}
 # double that problem. A saturated pool queues, which is honest here:
 # `queued` is a real state the client can see.
 MAX_WORKERS = 4
+
+# Process-local safety limit for real calls. Fake runs do not use it.
+MAX_LIVE_CONCURRENT = 1
 
 # How many connections the OS may hold waiting to be accepted.
 #
@@ -170,7 +180,10 @@ def queued_entry(resolution_id: str, case: Case, mode: str) -> dict[str, Any]:
 
 
 def _run_resolution(
-    resolutions: ResolutionStore, resolution_id: str, request: ResolutionRequest
+    resolutions: ResolutionStore,
+    resolution_id: str,
+    request: ResolutionRequest,
+    live_capacity: threading.BoundedSemaphore | None = None,
 ) -> None:
     """Run one resolution to completion, off the request thread.
 
@@ -192,23 +205,37 @@ def _run_resolution(
     or an input, and none of that belongs in a stored payload.
     """
     try:
-        resolve(request, StoreObserver(resolutions, resolution_id))
-    except Exception:
         try:
-            resolutions.update(
-                resolution_id,
-                {
-                    "state": "failed",
-                    "verdict": None,
-                    "error": {
-                        "code": "resolution_failed",
-                        "message": "the resolution could not be completed",
+            resolve(request, StoreObserver(resolutions, resolution_id))
+        except Exception as exc:
+            if isinstance(exc, ProviderCallFailedError):
+                code = "provider_failed"
+            elif isinstance(exc, TimeoutError):
+                code = "calle_timeout"
+            elif isinstance(exc, CallEAPIError):
+                code = "calle_auth_error" if exc.status_code in {401, 403} else "calle_api_error"
+            elif request.allow_live:
+                code = "calle_network_error"
+            else:
+                code = "resolution_failed"
+            try:
+                resolutions.update(
+                    resolution_id,
+                    {
+                        "state": "failed",
+                        "verdict": None,
+                        "error": {
+                            "code": code,
+                            "message": "the resolution could not be completed",
+                        },
                     },
-                },
-            )
-        except ResolutionNotFoundError:
-            # Evicted while running; there is nothing left to mark.
-            return
+                )
+            except ResolutionNotFoundError:
+                # Evicted while running; there is nothing left to mark.
+                return
+    finally:
+        if live_capacity is not None:
+            live_capacity.release()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -229,6 +256,10 @@ class Handler(BaseHTTPRequestHandler):
     @property
     def executor(self) -> ThreadPoolExecutor:
         return self.server.executor  # type: ignore[attr-defined]
+
+    @property
+    def live_capacity(self) -> threading.BoundedSemaphore:
+        return self.server.live_capacity  # type: ignore[attr-defined]
 
     def log_message(self, *args: Any) -> None:
         """Silent, same as fake_server.py. The default writes the request
@@ -280,7 +311,7 @@ class Handler(BaseHTTPRequestHandler):
         them gone. Doing both in one place means no route can forget the
         half it does not care about.
 
-        Neither route reads input, and skipping this was a real defect
+        Other routes do not read input, and skipping this was a real defect
         rather than a theoretical one: under protocol_version HTTP/1.1
         the bytes stayed in the socket, and the following request on the
         same connection was parsed starting from them - answering with
@@ -398,32 +429,73 @@ class Handler(BaseHTTPRequestHandler):
                 "unknown_field", f"this endpoint accepts only {sorted(RESOLUTION_REQUEST_FIELDS)}"
             )
 
-        # Checked before anything else about the case, because a mode
-        # this build cannot drive makes the rest moot.
+        # Check the mode before loading a case so the request contract is
+        # deterministic and unsupported values cannot steer execution.
         execution_mode = payload.get("execution_mode")
-        if execution_mode not in KNOWN_EXECUTION_MODES:
+        if not isinstance(execution_mode, str) or execution_mode not in KNOWN_EXECUTION_MODES:
             return 422, error_payload(
                 "invalid_execution_mode",
                 f"execution_mode is required and must be one of {sorted(KNOWN_EXECUTION_MODES)}",
             )
-        if execution_mode not in IMPLEMENTED_EXECUTION_MODES:
-            return 501, error_payload(
-                "live_not_available",
-                "live execution is not available in this build; no real call can be placed",
-            )
-
         case_name = payload.get("case")
         if not isinstance(case_name, str) or not case_name:
             return 422, error_payload("invalid_case", "case must be a non-empty string")
 
-        scenario = payload.get("scenario", DEFAULT_SCENARIO)
-        if scenario not in SCENARIO_PHONES:
-            return 422, error_payload(
-                "invalid_scenario", f"scenario must be one of {sorted(SCENARIO_PHONES)}"
-            )
-
         now_utc = None
-        if "now_utc" in payload:
+        if execution_mode == "fake":
+            forbidden = sorted(set(payload) - FAKE_REQUEST_FIELDS)
+            if forbidden:
+                return 422, error_payload(
+                    "field_not_allowed", f"fields are not allowed in fake mode: {forbidden}"
+                )
+            scenario = payload.get("scenario", DEFAULT_SCENARIO)
+            if not isinstance(scenario, str) or scenario not in SCENARIO_PHONES:
+                return 422, error_payload(
+                    "invalid_scenario", f"scenario must be one of {sorted(SCENARIO_PHONES)}"
+                )
+        else:
+            forbidden = sorted(set(payload) - LIVE_REQUEST_FIELDS)
+            if forbidden:
+                return 422, error_payload(
+                    "field_not_allowed", f"fields are not allowed in live mode: {forbidden}"
+                )
+            scenario = None
+            api_key_header = self.headers.get("X-Calle-Api-Key")
+            api_key = api_key_header if api_key_header is not None else ""
+            if not api_key.strip():
+                return 401, error_payload("missing_api_key", "X-Calle-Api-Key is required for live execution")
+            if "gdpr_basis_documented" in payload and type(payload["gdpr_basis_documented"]) is not bool:
+                return 422, error_payload(
+                    "invalid_gdpr_basis_documented", "gdpr_basis_documented must be a boolean"
+                )
+            destination = payload.get("destination")
+            authorize_destination = payload.get("authorize_destination")
+            if not isinstance(destination, str) or not destination:
+                return 422, error_payload("missing_destination", "destination is required in live mode")
+            if not isinstance(authorize_destination, str) or not authorize_destination:
+                return 422, error_payload(
+                    "missing_authorize_destination", "authorize_destination is required in live mode"
+                )
+            try:
+                build_recipient(destination, None, None)
+            except (TypeError, ValueError):
+                return 422, error_payload("invalid_destination", "destination must be strict ASCII E.164")
+            try:
+                build_recipient(authorize_destination, None, None)
+            except (TypeError, ValueError):
+                return 422, error_payload(
+                    "invalid_authorize_destination", "authorize_destination must be strict ASCII E.164"
+                )
+            if destination != authorize_destination:
+                return 422, error_payload(
+                    "destination_authorization_mismatch",
+                    "destination and authorize_destination must match exactly",
+                )
+
+        if execution_mode == "fake" and self.headers.get("X-Calle-Api-Key") is not None:
+            return 422, error_payload("api_key_not_allowed", "X-Calle-Api-Key is only accepted in live mode")
+
+        if execution_mode == "fake" and "now_utc" in payload:
             if not isinstance(payload["now_utc"], str):
                 return 422, error_payload("invalid_now_utc", "now_utc must be an ISO 8601 UTC string")
             try:
@@ -442,26 +514,36 @@ class Handler(BaseHTTPRequestHandler):
         except CaseNotFoundError:
             return 404, error_payload("case_not_found", "no such case")
 
-        # Everything a client cannot influence is fixed here. base_url
-        # comes from the backend this process started, allow_live is
-        # False and there is no code path that sets it otherwise, and
-        # execute targets that same fake backend - the alternative,
-        # dry-run, stops before a verdict exists and would leave the
-        # cockpit with nothing to show.
+        # Fake demonstration time is relative to the fixture, not today's
+        # clock. Explicit test times remain supported; no-call always
+        # prepares R4=false, even when a frontend also sends now_utc.
+        if execution_mode == "fake" and scenario == "no-call":
+            now_utc = case.deadline - case.decision_deadline_threshold - timedelta(seconds=1)
+        elif execution_mode == "fake" and now_utc is None:
+            now_utc = case.deadline - case.decision_deadline_threshold / 2
+
+        live = execution_mode == "live"
         request = ResolutionRequest(
             case_path=str(case_path),
-            base_url=self.backend.base_url,
+            base_url=REAL_API_BASE_URL if live else self.backend.base_url,
             execute=True,
-            allow_live=False,
-            authorize_destination=None,
-            phone_override=SCENARIO_PHONES[scenario],
+            allow_live=live,
+            authorize_destination=authorize_destination if live else None,
+            api_key=api_key if live else None,
+            phone_override=destination if live else SCENARIO_PHONES[scenario],
             now_utc=now_utc,
+            gdpr_basis_documented=(payload.get("gdpr_basis_documented", False) if live else False),
             poll_interval_seconds=0.01,
             poll_timeout_seconds=MAX_POLL_SECONDS,
         )
 
-        resolution_id = self.resolutions.new_id()
-        seed = queued_entry(resolution_id, case, MODE)
+        live_capacity = None
+        if live:
+            if not self.live_capacity.acquire(blocking=False):
+                return 429, error_payload(
+                    "live_capacity_reached", "one live resolution is already in progress"
+                )
+            live_capacity = self.live_capacity
 
         # Seeded before the work is submitted, never after. The observer
         # publishes through store.update(), which requires the entry to
@@ -472,8 +554,17 @@ class Handler(BaseHTTPRequestHandler):
         # over the same object would leave the response being serialized
         # while a worker mutates it - a 202 that sometimes says "running",
         # or worse, a torn mixture of two states.
-        self.resolutions.put(resolution_id, dict(seed))
-        self.executor.submit(_run_resolution, self.resolutions, resolution_id, request)
+        try:
+            resolution_id = self.resolutions.new_id()
+            seed = queued_entry(resolution_id, case, execution_mode)
+            self.resolutions.put(resolution_id, dict(seed))
+            self.executor.submit(_run_resolution, self.resolutions, resolution_id, request, live_capacity)
+        except Exception:
+            if live_capacity is not None:
+                live_capacity.release()
+            return 503, error_payload(
+                "resolution_submit_failed", "the resolution could not be accepted"
+            )
         return 202, seed
 
     def handle_get_resolution(self, resolution_id: str) -> tuple[int, dict[str, Any]]:
@@ -522,13 +613,13 @@ def create_server(
     server.executor = (  # type: ignore[attr-defined]
         executor if executor is not None else ThreadPoolExecutor(max_workers=MAX_WORKERS)
     )
+    server.live_capacity = threading.BoundedSemaphore(MAX_LIVE_CONCURRENT)  # type: ignore[attr-defined]
     return server
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="HTTP surface for Reality Resolver, against an in-process fake CALL-E "
-        "backend. Places no real calls: there is no live mode to select."
+        description="HTTP surface for Reality Resolver, with fake and explicitly authorized live CALL-E modes."
     )
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -539,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     server = create_server(args.host, args.port, backend=backend, executor=executor)
     host, port = server.server_address[:2]
-    print(f"Reality Resolver API on http://{host}:{port} (mode={MODE}, no real call can be placed)", flush=True)
+    print(f"Reality Resolver API on http://{host}:{port} (mode={MODE})", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

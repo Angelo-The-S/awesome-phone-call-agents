@@ -18,10 +18,9 @@ resolution payloads on the same rule.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
-from client import mask_phone
+from client import _OBVIOUS_SECRET, _PHONE_IN_TEXT, mask_phone
 from compliance.models import PreCallDecision
 from evidence.engine import ReasoningResult
 from evidence.model import Case, Evidence
@@ -113,11 +112,10 @@ def cases_payload(cases: tuple[Case, ...]) -> dict[str, Any]:
 # silently the next time a rule is written the same way - every reason
 # this module emits is scrubbed by the same function.
 #
-# Same shape as client.PHONE_PATTERN and [0-9] for the same reason: for a
+# Shared with client.PHONE_PATTERN and [0-9] for the same reason: for a
 # str pattern \d matches every Unicode decimal digit, so a number written
 # in Arabic-Indic or fullwidth digits would slip past a \d version of
 # this and reach the client intact.
-_PHONE_IN_TEXT = re.compile(r"\+[1-9][0-9]{6,14}")
 
 
 def sanitize_reason(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
@@ -193,6 +191,16 @@ ALLOWED_RESULT_KEYS = (
     "manipulation_attempt_note",
 )
 
+_RESULT_ENUMS = {
+    "subject_intent": {"confirmed", "cancelled", "uncertain", "unknown"},
+    "answered_by": {"human", "voicemail", "ivr", "unknown"},
+}
+_PROVIDER_STATUSES = {"queued", "in_progress", "completed", "failed", "canceled"}
+
+
+def _provider_text(value: str) -> str:
+    return sanitize_reason(_OBVIOUS_SECRET.sub("[redacted]", value))
+
 
 def call_projection(call: dict[str, Any] | None, placed: bool) -> dict[str, Any]:
     """Three facts and the structured result. Nothing else from the
@@ -213,19 +221,25 @@ def call_projection(call: dict[str, Any] | None, placed: bool) -> dict[str, Any]
     if call is None:
         return {"placed": placed, "provider_status": None, "result": None}
 
-    raw_result = call.get("structured_result") or {}
-    result = {
-        key: (_text(value) if isinstance(value, str) else value)
-        for key, value in raw_result.items()
-        if key in ALLOWED_RESULT_KEYS
-    } or None
+    raw_result = call.get("structured_result")
+    result: dict[str, Any] = {}
+    if isinstance(raw_result, dict):
+        for key in ALLOWED_RESULT_KEYS:
+            value = raw_result.get(key)
+            if key in _RESULT_ENUMS:
+                if isinstance(value, str) and value in _RESULT_ENUMS[key]:
+                    result[key] = value
+            elif key == "manipulation_attempt_detected":
+                if type(value) is bool:
+                    result[key] = value
+            elif isinstance(value, str):
+                result[key] = _provider_text(value)
+    status = call.get("status")
 
     return {
         "placed": placed,
-        "provider_status": _text(str(call.get("status")), MAX_IDENTIFIER_CHARS)
-        if call.get("status") is not None
-        else None,
-        "result": result,
+        "provider_status": status if isinstance(status, str) and status in _PROVIDER_STATUSES else None,
+        "result": result or None,
     }
 
 

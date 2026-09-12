@@ -55,7 +55,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
@@ -108,6 +108,10 @@ TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled"})
 # compliance/dispatcher.py), so a non-ASCII digit here would also silently
 # degrade routing rather than fail closed.
 PHONE_PATTERN = re.compile(r"^\+[1-9][0-9]{6,14}$")
+
+# Provider messages are untrusted text. Keep these recognizers shared with
+# the HTTP projection layer so phone and obvious-secret masking cannot drift.
+_PHONE_IN_TEXT = re.compile(r"\+[1-9][0-9]{6,14}")
 
 # Fields accepted at the top level of CreateCallRequest. The real API rejects
 # unknown fields (additionalProperties: false), so the client only ever
@@ -163,6 +167,17 @@ ERROR_HINTS = {
     "unauthorized": "CALLE_API_KEY is missing, malformed, expired, or invalid.",
     "forbidden": "The API key is valid but lacks access to this project, region, or operation.",
 }
+
+MAX_PROVIDER_ERROR_MESSAGE_CHARS = 1000
+MAX_PROVIDER_ERROR_CODE_CHARS = 64
+_OBVIOUS_SECRET = re.compile(
+    r"\b(?:Bearer\s+[A-Za-z0-9._~+/=-]+|"
+    r"(?:iams_|sk-|sk_)[A-Za-z0-9_-]+|"
+    r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|"
+    r"(?:api[_-]?key|access[_-]?token|token|secret|password)\s*[:=]\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+))",
+    re.IGNORECASE,
+)
 
 # Status codes worth a bounded retry: rate limiting and transient provider
 # or server trouble. Everything else is treated as a final answer.
@@ -309,6 +324,24 @@ def mask_phone(phone: str | None) -> str:
     return f"{prefix}...{phone[-4:]}"
 
 
+def sanitize_provider_error_code(value: Any) -> str:
+    """Return a bounded, log-safe provider error code."""
+    text = value if isinstance(value, str) else repr(value)
+    if text in KNOWN_ERROR_CODES:
+        return text
+    if re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", text):
+        return text[:MAX_PROVIDER_ERROR_CODE_CHARS]
+    return "unknown_error"
+
+
+def sanitize_provider_error_message(value: Any) -> str:
+    """Mask phones/secrets and escape controls before provider-error logging."""
+    text = value if isinstance(value, str) else repr(value)
+    text = _OBVIOUS_SECRET.sub("[redacted]", text)
+    text = _PHONE_IN_TEXT.sub(lambda match: mask_phone(match.group(0)), text)
+    return sanitize_for_display(text, MAX_PROVIDER_ERROR_MESSAGE_CHARS)
+
+
 def require_api_key() -> str:
     api_key = os.environ.get(API_KEY_ENV_VAR)
     if not api_key:
@@ -355,7 +388,7 @@ def resolve_api_key(request: ApiKeyContext) -> str:
 
 
 def build_recipient(phone: str, locale: str | None, region: str | None) -> dict[str, Any]:
-    if not PHONE_PATTERN.match(phone):
+    if not PHONE_PATTERN.fullmatch(phone):
         raise ValueError(
             f"phone {mask_phone(phone)!r} is not valid E.164 (expected pattern {PHONE_PATTERN.pattern})"
         )
@@ -614,7 +647,7 @@ def build_hardened_task(operator_task: str, disclosure_script: str | None = None
 @dataclass
 class CallEClient:
     base_url: str
-    api_key: str
+    api_key: str = field(repr=False)
     allow_live: bool = False
     timeout_seconds: float = 30.0
 
@@ -680,11 +713,23 @@ class CallEClient:
                 try:
                     payload = json.loads(exc.read().decode("utf-8") or "{}")
                 except json.JSONDecodeError as decode_exc:
+                    print(
+                        f"CALL-E provider_error status={exc.code} code=invalid_error_body "
+                        "message=provider error body was not valid JSON",
+                        flush=True,
+                    )
                     raise RuntimeError(
                         f"{method} {url} returned HTTP {exc.code} with a body that is not valid JSON: {decode_exc}"
                     ) from decode_exc
                 error = payload.get("error", {})
                 code = error.get("code", "unknown_error")
+                provider_message = error.get("message", str(exc))
+                print(
+                    f"CALL-E provider_error status={exc.code} "
+                    f"code={sanitize_provider_error_code(code)} "
+                    f"message={sanitize_provider_error_message(provider_message)}",
+                    flush=True,
+                )
                 if retryable and exc.code in RETRYABLE_STATUS_CODES and attempt < MAX_ATTEMPTS:
                     retry_after = exc.headers.get("Retry-After") if exc.headers else None
                     delay = float(retry_after) if retry_after else BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
@@ -699,7 +744,7 @@ class CallEClient:
                     time.sleep(delay)
                     last_error = None
                     continue
-                raise CallEAPIError(exc.code, code, error.get("message", str(exc)), error.get("details", {})) from exc
+                raise CallEAPIError(exc.code, code, provider_message, error.get("details", {})) from exc
             except urllib.error.URLError as exc:
                 # exc.reason is produced by urllib/the socket layer, but a
                 # TLS failure can embed server-supplied text (certificate

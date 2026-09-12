@@ -61,6 +61,14 @@ class ResolutionRefused(Exception):
     """
 
 
+class ProviderCallFailedError(RuntimeError):
+    """CALL-E accepted the request but ended the call technically."""
+
+    def __init__(self, status: str) -> None:
+        self.status = status
+        super().__init__(f"CALL-E call ended with provider status {status!r}")
+
+
 @dataclass(frozen=True)
 class ResolutionRequest:
     """Everything the pipeline needs, with no argparse dependency.
@@ -358,6 +366,13 @@ def resolve(request: ResolutionRequest, observer: Observer | None = None) -> Res
         on_warn=observer.on_poll_warning,
     )
     observer.on_call_completed(final_call)
+
+    provider_status = final_call.get("status")
+    if provider_status in {"failed", "canceled"}:
+        # A provider failure is transport state, never a subject intent.
+        # Do not let reconciliation turn it into a business cancellation
+        # or an ambiguous answer.
+        raise ProviderCallFailedError(provider_status)
 
     structured_result = final_call.get("structured_result")
     verdict = reconcile(structured_result, case.decision_options, case.evidence)

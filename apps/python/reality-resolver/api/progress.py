@@ -102,7 +102,8 @@ class StoreObserver(Observer):
         self._publish(
             {
                 "state": "running",
-                "mode": mode,
+                # The seed owns HTTP execution mode (fake/live). The
+                # pipeline's EXECUTE/DRY-RUN label belongs to the CLI.
                 "case": case_summary(case),
                 "evidence": [evidence_item(item) for item in case.evidence.items],
             }
