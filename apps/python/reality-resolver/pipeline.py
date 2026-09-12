@@ -80,6 +80,9 @@ class ResolutionRequest:
 
     case_path: str
     base_url: str
+    # Custom HTTP cases are normalized into the same engine model and kept
+    # in memory. The path remains the CLI/shipped-case contract.
+    case: Case | None = field(default=None, repr=False)
     execute: bool = False
     allow_live: bool = False
     authorize_destination: str | None = None
@@ -246,7 +249,7 @@ def resolve(request: ResolutionRequest, observer: Observer | None = None) -> Res
 
     _check_preconditions(request)
 
-    case = load_case(request.case_path)
+    case = request.case if request.case is not None else load_case(request.case_path)
     if request.phone_override:
         case = replace(case, call_phone=request.phone_override)
 

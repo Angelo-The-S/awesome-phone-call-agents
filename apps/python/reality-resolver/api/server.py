@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from api.backend import FakeCallBackend
+from api.custom_case import CustomCaseValidationError, parse_custom_case
 from api.progress import StoreObserver
 from api.serialize import case_summary, cases_payload, error_payload, health_payload
 from api.store import CaseNotFoundError, CaseStore, ResolutionNotFoundError, ResolutionStore
@@ -68,7 +69,7 @@ DRAIN_CHUNK_BYTES = 64 * 1024
 RESOLUTIONS_PATH = "/api/resolutions"
 CORS_ORIGIN_ENV = "REALITY_RESOLVER_CORS_ORIGIN"
 CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
-CORS_ALLOW_HEADERS = "Content-Type"
+CORS_ALLOW_HEADERS = "Content-Type, X-Calle-Api-Key"
 
 # Upper bound on the polling loop of one HTTP-driven resolution.
 #
@@ -107,9 +108,16 @@ DEFAULT_SCENARIO = "confirmed"
 
 # The HTTP contract is split by execution mode. Values from the other
 # mode are rejected explicitly instead of being silently ignored.
-FAKE_REQUEST_FIELDS = frozenset({"case", "execution_mode", "scenario", "now_utc"})
+FAKE_REQUEST_FIELDS = frozenset({"case", "execution_mode", "scenario", "now_utc", "custom_case"})
 LIVE_REQUEST_FIELDS = frozenset(
-    {"case", "execution_mode", "destination", "authorize_destination", "gdpr_basis_documented"}
+    {
+        "case",
+        "execution_mode",
+        "destination",
+        "authorize_destination",
+        "gdpr_basis_documented",
+        "custom_case",
+    }
 )
 RESOLUTION_REQUEST_FIELDS = FAKE_REQUEST_FIELDS | LIVE_REQUEST_FIELDS
 
@@ -477,6 +485,17 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(case_name, str) or not case_name:
             return 422, error_payload("invalid_case", "case must be a non-empty string")
 
+        custom_case = None
+        if "custom_case" in payload:
+            if case_name != "custom":
+                return 422, error_payload("invalid_case", "custom_case requires case=custom")
+            try:
+                custom_case = parse_custom_case(payload["custom_case"])
+            except CustomCaseValidationError as exc:
+                return 422, error_payload(exc.code, exc.message)
+        elif case_name == "custom":
+            return 422, error_payload("missing_custom_case", "custom_case is required for case=custom")
+
         now_utc = None
         if execution_mode == "fake":
             forbidden = sorted(set(payload) - FAKE_REQUEST_FIELDS)
@@ -544,11 +563,15 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, argparse.ArgumentTypeError):
                 return 422, error_payload("invalid_now_utc", "now_utc must be an ISO 8601 UTC string")
 
-        try:
-            case_path = self.store.path_for(case_name)
-            case = self.store.get(case_name)
-        except CaseNotFoundError:
-            return 404, error_payload("case_not_found", "no such case")
+        if custom_case is not None:
+            case_path = None
+            case = custom_case
+        else:
+            try:
+                case_path = self.store.path_for(case_name)
+                case = self.store.get(case_name)
+            except CaseNotFoundError:
+                return 404, error_payload("case_not_found", "no such case")
 
         # Fake demonstration time is relative to the fixture, not today's
         # clock. Explicit test times remain supported; no-call always
@@ -560,8 +583,9 @@ class Handler(BaseHTTPRequestHandler):
 
         live = execution_mode == "live"
         request = ResolutionRequest(
-            case_path=str(case_path),
+            case_path=str(case_path or ""),
             base_url=REAL_API_BASE_URL if live else self.backend.base_url,
+            case=custom_case,
             execute=True,
             allow_live=live,
             authorize_destination=authorize_destination if live else None,

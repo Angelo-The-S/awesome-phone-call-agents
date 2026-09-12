@@ -340,6 +340,7 @@ def test_authorized_options_returns_minimal_preflight_headers(monkeypatch: pytes
             assert "POST" in response.headers["Access-Control-Allow-Methods"]
             assert "OPTIONS" in response.headers["Access-Control-Allow-Methods"]
             assert "Content-Type" in response.headers["Access-Control-Allow-Headers"]
+            assert "X-Calle-Api-Key" in response.headers["Access-Control-Allow-Headers"]
             assert response.headers["Vary"] == "Origin"
             assert response.read() == b""
 
