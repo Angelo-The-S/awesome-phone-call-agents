@@ -52,7 +52,7 @@ def _seeded_store() -> tuple[ResolutionStore, str]:
     """
     store = ResolutionStore()
     resolution_id = ResolutionStore.new_id()
-    store.put(resolution_id, {"id": resolution_id, "state": "queued", "error": None})
+    store.put(resolution_id, {"id": resolution_id, "state": "queued", "mode": "fake", "error": None})
     return store, resolution_id
 
 
@@ -356,7 +356,7 @@ def test_the_published_state_matches_the_payload_the_pipeline_would_produce() ->
     published = store.get(rid)
     expected = resolution_payload(resolution, rid, "completed", "fake")
 
-    for key in ("id", "state", "case", "evidence", "reasoning", "call_decision", "verdict"):
+    for key in ("id", "state", "mode", "case", "evidence", "reasoning", "call_decision", "verdict"):
         assert published[key] == expected[key], f"{key} diverged"
 
     # call: same projection, and identical here because the projection

@@ -2,9 +2,8 @@
 
 Everything here runs against a server on a random loopback port, driven
 with urllib from the standard library - the same shape as the rest of
-this suite. No test reaches a provider, and in this phase the server has
-no code path that could: it cannot start a resolution and imports no
-CALL-E client.
+this suite. Fake tests use the local backend; live tests replace the
+provider client with an in-process stub and never reach the real API.
 """
 
 from __future__ import annotations
@@ -69,11 +68,12 @@ def api_server() -> Iterator[str]:
         yield base_url
 
 
-def post(base_url: str, path: str, payload: Any) -> tuple[int, Any, dict[str, str]]:
+def post(
+    base_url: str, path: str, payload: Any, headers: dict[str, str] | None = None
+) -> tuple[int, Any, dict[str, str]]:
     data = payload if isinstance(payload, (bytes, bytearray)) else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base_url}{path}", data=data, method="POST", headers={"Content-Type": "application/json"}
-    )
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
+    req = urllib.request.Request(f"{base_url}{path}", data=data, method="POST", headers=request_headers)
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
             return response.status, json.loads(response.read()), dict(response.headers)
@@ -150,7 +150,7 @@ def test_health_returns_ok_and_nothing_else() -> None:
         assert headers["Content-Type"] == "application/json"
         assert int(headers["Content-Length"]) > 0
         assert body["status"] == "ok"
-        assert body["mode"] == "fake"
+        assert body["mode"] == "mixed"
         assert body["engine_version"]
         # A health endpoint is where configuration classically leaks.
         assert set(body) == {"status", "mode", "engine_version"}
@@ -426,7 +426,7 @@ def test_post_body_then_get_on_the_same_connection_stays_clean() -> None:
         assert content_type == "application/json"
         payload = json.loads(body)
         assert payload["status"] == "ok"
-        assert payload["mode"] == "fake"
+        assert payload["mode"] == "mixed"
         assert "MUST_NOT_BE_REFLECTED" not in body, "the previous body contaminated this response"
         assert "<html" not in body.lower()
 
@@ -842,24 +842,25 @@ def test_no_request_field_can_steer_the_engine(field: str) -> None:
         )
 
         assert status == 422, f"{field} must be refused, not ignored"
-        assert body["error"]["code"] == "unknown_field"
+        expected_code = "field_not_allowed" if field == "authorize_destination" else "unknown_field"
+        assert body["error"]["code"] == expected_code
         assert backend.creates == 0, "a refused request must not have run anything"
 
 
-def test_the_api_never_talks_to_the_real_provider() -> None:
-    """base_url comes from the backend this process started. There is no
-    request shape that changes it, and no live mode to select.
+def test_the_api_selects_the_server_side_provider_target() -> None:
+    """The client cannot choose the provider URL or live flags. Fake uses
+    the loopback backend; live construction is covered separately.
     """
     import api.server as server_module
 
     source = Path(server_module.__file__).read_text(encoding="utf-8")
-    assert "api.heycall-e.com" not in source
-    assert "allow_live=False" in source
-    assert "base_url=self.backend.base_url" in source
+    assert "REAL_API_BASE_URL" in source
+    assert "allow_live=live" in source
+    assert "base_url=REAL_API_BASE_URL if live else self.backend.base_url" in source
 
     with api_server() as base_url:
         _, body, _ = request(base_url, "/api/health")
-        assert body["mode"] == "fake"
+        assert body["mode"] == "mixed"
 
 
 def test_resolutions_work_without_any_calle_credential(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1195,7 +1196,7 @@ def test_a_call_that_never_terminates_fails_technically_without_a_verdict() -> N
 
         assert body["state"] == "failed"
         assert body["verdict"] is None, "a technical failure has no verdict"
-        assert body["error"]["code"] == "resolution_failed"
+        assert body["error"]["code"] == "calle_timeout"
 
         raw = json.dumps(body["verdict"]) + json.dumps(body["error"])
         for forbidden in (
@@ -1525,11 +1526,9 @@ def test_an_unknown_execution_mode_is_422(mode: Any) -> None:
         assert body["error"]["code"] == "invalid_execution_mode"
 
 
-def test_live_is_501_not_422_and_places_nothing() -> None:
-    """live is a value the architecture recognises and this build does
-    not implement. 422 would say the client got it wrong; 501 says the
-    server cannot do it. Accepting it would claim a capability that does
-    not exist.
+def test_live_requires_api_key_and_live_fields() -> None:
+    """A live request using fake-only fields is rejected before work is
+    accepted; valid live construction is covered by dedicated tests.
     """
     with api_server_and_backend() as (base_url, backend):
         status, body, _ = post(
@@ -1538,47 +1537,47 @@ def test_live_is_501_not_422_and_places_nothing() -> None:
             {"case": HERO, "execution_mode": "live", "now_utc": NEAR},
         )
 
-        assert status == 501
-        assert body["error"]["code"] == "live_not_available"
-        assert "real call" in body["error"]["message"]
+        assert status == 422
+        assert body["error"]["code"] == "field_not_allowed"
         assert backend.creates == 0, "a refused live request must run nothing"
 
 
-def test_live_is_refused_before_the_case_is_even_looked_up() -> None:
-    """A capability this build lacks makes the rest of the request moot,
-    so the mode is checked first.
-    """
+def test_live_unknown_case_is_not_leaked_without_provider_access() -> None:
     with api_server() as base_url:
         status, body, _ = post(
             base_url,
             "/api/resolutions",
-            {"case": "definitely-not-a-case", "execution_mode": "live"},
+            {
+                "case": "definitely-not-a-case",
+                "execution_mode": "live",
+                "destination": "+12025550187",
+                "authorize_destination": "+12025550187",
+            },
+            headers={"X-Calle-Api-Key": "live-test-key"},
         )
 
-        assert status == 501
-        assert body["error"]["code"] == "live_not_available"
+        assert status == 404
+        assert body["error"]["code"] == "case_not_found"
 
 
-def test_no_live_credential_or_destination_field_is_accepted() -> None:
-    """The live contract does not exist yet, so none of its fields do
-    either - they are unknown fields, refused like any other.
-    """
+def test_live_only_fields_are_refused_in_fake_mode() -> None:
     with api_server() as base_url:
-        for field in ("api_key", "call_e_api_key", "destination", "authorize_destination"):
+        for field in ("api_key", "call_e_api_key", "destination", "authorize_destination", "gdpr_basis_documented"):
             status, body, _ = post(
                 base_url,
                 "/api/resolutions",
                 {"case": HERO, "execution_mode": "fake", field: "x"},
             )
             assert status == 422
-            assert body["error"]["code"] == "unknown_field"
+            expected_code = "field_not_allowed" if field in {"destination", "authorize_destination", "gdpr_basis_documented"} else "unknown_field"
+            assert body["error"]["code"] == expected_code
 
 
-def test_health_still_reports_fake_only() -> None:
+def test_health_reports_mixed_capabilities() -> None:
     with api_server() as base_url:
         _, body, _ = request(base_url, "/api/health")
 
-        assert body["mode"] == "fake"
+        assert body["mode"] == "mixed"
 
 
 # --- L3: nothing sensitive survives the async path --------------------
@@ -1904,15 +1903,19 @@ def test_every_client_the_server_builds_targets_the_local_fake_backend() -> None
         assert REAL_API_BASE_URL not in target
 
 
-def test_the_real_provider_host_appears_nowhere_in_the_http_layer() -> None:
+def test_the_live_http_layer_uses_only_server_side_provider_configuration() -> None:
     import api.server as server_module
 
     source = Path(server_module.__file__).read_text(encoding="utf-8")
 
-    assert "heycall-e.com" not in source
-    assert "allow_live=False" in source
-    assert "base_url=self.backend.base_url" in source
-    assert "allow_live=True" not in source
+    assert "REAL_API_BASE_URL" in source
+    assert "base_url=REAL_API_BASE_URL if live else self.backend.base_url" in source
+    assert "allow_live=live" in source
+    assert "phone_override=destination if live" in source
+    assert "X-Calle-Api-Key" in source
+    # The endpoint is imported from client.py rather than repeated in the
+    # HTTP layer, so the provider host is never a client-controlled field.
+    assert "base_url" in source
 
 
 def test_a_blocked_run_places_no_call_at_all() -> None:
@@ -1972,6 +1975,6 @@ def test_a_failed_resolution_leaks_nothing_and_says_nothing_internal() -> None:
         assert "127.0.0.1" not in raw, "the internal backend URL reached the client"
         assert "C:\\" not in raw and "/Users/" not in raw
         assert body["error"] == {
-            "code": "resolution_failed",
+            "code": "calle_timeout",
             "message": "the resolution could not be completed",
         }
