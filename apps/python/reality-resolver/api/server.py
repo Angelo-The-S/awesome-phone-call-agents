@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -65,6 +66,9 @@ MAX_DRAIN_BYTES = 1 << 20  # 1 MiB
 DRAIN_CHUNK_BYTES = 64 * 1024
 
 RESOLUTIONS_PATH = "/api/resolutions"
+CORS_ORIGIN_ENV = "REALITY_RESOLVER_CORS_ORIGIN"
+CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
+CORS_ALLOW_HEADERS = "Content-Type"
 
 # Upper bound on the polling loop of one HTTP-driven resolution.
 #
@@ -268,8 +272,18 @@ class Handler(BaseHTTPRequestHandler):
         """
         return
 
+    def _cors_headers(self) -> dict[str, str]:
+        configured_origin = os.environ.get(CORS_ORIGIN_ENV)
+        request_origin = self.headers.get("Origin")
+        if configured_origin and configured_origin != "*" and request_origin == configured_origin:
+            return {
+                "Access-Control-Allow-Origin": configured_origin,
+                "Vary": "Origin",
+            }
+        return {}
+
     def _send(self, status: int, body: dict[str, Any], extra_headers: dict[str, str] | None = None) -> None:
-        raw = json.dumps(body).encode("utf-8")
+        raw = b"" if status == 204 else json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
@@ -279,10 +293,13 @@ class Handler(BaseHTTPRequestHandler):
             # closing without the header leaves the client believing it
             # may send another request down a socket that is going away.
             self.send_header("Connection", "close")
-        for name, value in (extra_headers or {}).items():
+        headers = self._cors_headers()
+        headers.update(extra_headers or {})
+        for name, value in headers.items():
             self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(raw)
+        if raw:
+            self.wfile.write(raw)
 
     def _path(self) -> str:
         return urlparse(self.path).path.rstrip("/") or "/"
@@ -395,6 +412,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self._dispatch("POST")
+
+    def do_OPTIONS(self) -> None:
+        self.body = self._read_request_body()
+        path = self._path()
+        if path not in ROUTES and not path.startswith(f"{RESOLUTIONS_PATH}/"):
+            self._not_found()
+            return
+
+        if self._cors_headers():
+            self._send(
+                204,
+                {},
+                {
+                    "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+                    "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+                },
+            )
+            return
+        self._send(204, {})
 
     # --- route handlers ------------------------------------------------
 

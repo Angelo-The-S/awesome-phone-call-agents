@@ -265,11 +265,127 @@ def test_post_to_cases_is_405() -> None:
         assert headers["Allow"] == "GET"
 
 
-def test_no_cors_header_is_sent_by_default() -> None:
+def test_no_cors_header_is_sent_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("REALITY_RESOLVER_CORS_ORIGIN", raising=False)
     with api_server() as base_url:
-        _, _, headers = request(base_url, "/api/health")
+        req = urllib.request.Request(
+            f"{base_url}/api/health",
+            method="GET",
+            headers={"Origin": "https://reality-resolver-frontend.example"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            headers = response.headers
 
         assert "Access-Control-Allow-Origin" not in headers
+
+
+def test_configured_cors_origin_is_echoed_only_for_an_exact_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    allowed_origin = "https://reality-resolver-frontend.example"
+    monkeypatch.setenv("REALITY_RESOLVER_CORS_ORIGIN", allowed_origin)
+
+    with api_server() as base_url:
+        _, _, allowed_headers = request(
+            base_url,
+            "/api/health",
+            method="GET",
+        )
+        assert "Access-Control-Allow-Origin" not in allowed_headers
+
+        req = urllib.request.Request(
+            f"{base_url}/api/health",
+            method="GET",
+            headers={"Origin": allowed_origin},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            assert response.status == 200
+            assert response.headers["Access-Control-Allow-Origin"] == allowed_origin
+            assert response.headers["Vary"] == "Origin"
+
+        req = urllib.request.Request(
+            f"{base_url}/api/health",
+            method="GET",
+            headers={"Origin": "https://another-origin.example"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            assert "Access-Control-Allow-Origin" not in response.headers
+
+
+def test_wildcard_cors_configuration_is_never_echoed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REALITY_RESOLVER_CORS_ORIGIN", "*")
+
+    with api_server() as base_url:
+        req = urllib.request.Request(
+            f"{base_url}/api/health",
+            method="GET",
+            headers={"Origin": "*"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            assert "Access-Control-Allow-Origin" not in response.headers
+
+
+def test_authorized_options_returns_minimal_preflight_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    allowed_origin = "https://reality-resolver-frontend.example"
+    monkeypatch.setenv("REALITY_RESOLVER_CORS_ORIGIN", allowed_origin)
+
+    with api_server() as base_url:
+        req = urllib.request.Request(
+            f"{base_url}/api/resolutions",
+            method="OPTIONS",
+            headers={"Origin": allowed_origin, "Access-Control-Request-Method": "POST"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            assert response.status == 204
+            assert response.headers["Access-Control-Allow-Origin"] == allowed_origin
+            assert "GET" in response.headers["Access-Control-Allow-Methods"]
+            assert "POST" in response.headers["Access-Control-Allow-Methods"]
+            assert "OPTIONS" in response.headers["Access-Control-Allow-Methods"]
+            assert "Content-Type" in response.headers["Access-Control-Allow-Headers"]
+            assert response.headers["Vary"] == "Origin"
+            assert response.read() == b""
+
+
+def test_wrong_origin_options_receives_no_cors_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REALITY_RESOLVER_CORS_ORIGIN", "https://reality-resolver-frontend.example")
+
+    with api_server() as base_url:
+        req = urllib.request.Request(
+            f"{base_url}/api/resolutions",
+            method="OPTIONS",
+            headers={"Origin": "https://another-origin.example", "Access-Control-Request-Method": "POST"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            assert response.status == 204
+            assert "Access-Control-Allow-Origin" not in response.headers
+            assert "Access-Control-Allow-Methods" not in response.headers
+            assert "Access-Control-Allow-Headers" not in response.headers
+            assert "Vary" not in response.headers
+
+
+def test_configured_cors_does_not_change_existing_get_and_post_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allowed_origin = "https://reality-resolver-frontend.example"
+    monkeypatch.setenv("REALITY_RESOLVER_CORS_ORIGIN", allowed_origin)
+
+    with api_server() as base_url:
+        for path in ("/api/health", "/api/cases"):
+            req = urllib.request.Request(
+                f"{base_url}{path}",
+                method="GET",
+                headers={"Origin": allowed_origin},
+            )
+            with urllib.request.urlopen(req, timeout=10) as response:
+                assert response.status == 200
+
+        status, body, headers = post(
+            base_url,
+            "/api/resolutions",
+            {"case": "critical-service-escalation", "execution_mode": "fake", "scenario": "confirmed"},
+            headers={"Origin": allowed_origin},
+        )
+        assert status == 202
+        assert body["state"] == "queued"
+        assert headers["Access-Control-Allow-Origin"] == allowed_origin
 
 
 # --- G. no credential required ---------------------------------------
