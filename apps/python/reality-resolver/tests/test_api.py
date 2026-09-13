@@ -453,7 +453,8 @@ def test_the_http_layer_makes_no_decision_of_its_own() -> None:
     ):
         assert forbidden not in source, f"{forbidden} in the HTTP layer duplicates the pipeline"
 
-    assert "resolve(request, StoreObserver(" in source, (
+    assert "observer = StoreObserver(resolutions, resolution_id)" in source
+    assert "resolve(request, observer)" in source, (
         "the run must be delegated to the pipeline, with progress published rather than derived"
     )
 
@@ -1397,11 +1398,12 @@ def test_the_poll_bound_is_armed_on_the_http_path() -> None:
     """The constant exists and is actually handed to the pipeline. A
     bound nobody passes is not a bound.
     """
-    from api.server import MAX_POLL_SECONDS
+    from api.server import MAX_LIVE_POLL_SECONDS, MAX_POLL_SECONDS
 
     assert MAX_POLL_SECONDS == 10.0
+    assert MAX_LIVE_POLL_SECONDS == 180.0
     source = Path(__import__("api.server", fromlist=["x"]).__file__).read_text(encoding="utf-8")
-    assert "poll_timeout_seconds=MAX_POLL_SECONDS" in source
+    assert "poll_timeout_seconds=MAX_LIVE_POLL_SECONDS if live else MAX_POLL_SECONDS" in source
 
 
 def test_the_normal_branches_are_unaffected_by_the_bound() -> None:

@@ -90,6 +90,12 @@ CORS_ALLOW_HEADERS = "Content-Type, X-Calle-Api-Key"
 # does not justify. The ceiling is lowered here, not removed.
 MAX_POLL_SECONDS = 10.0
 
+# Real calls include ringing, conversation, and provider-side result
+# finalization. Keep the deterministic fake bound above, but give the live
+# provider a finite window that remains below the frontend's four-minute
+# polling ceiling.
+MAX_LIVE_POLL_SECONDS = 180.0
+
 # The fake scenarios, including the no-call clock preset, and the only way
 # a fake request influences which number is dialled. It picks an outcome
 # by name; the number is chosen here, from fake_server.py's own reserved
@@ -217,8 +223,9 @@ def _run_resolution(
     or an input, and none of that belongs in a stored payload.
     """
     try:
+        observer = StoreObserver(resolutions, resolution_id)
         try:
-            resolve(request, StoreObserver(resolutions, resolution_id))
+            resolve(request, observer)
         except Exception as exc:
             if isinstance(exc, ProviderCallFailedError):
                 code = "provider_failed"
@@ -230,6 +237,17 @@ def _run_resolution(
                 code = "calle_network_error"
             else:
                 code = "resolution_failed"
+            diagnostics = observer.diagnostics()
+            status_suffix = ""
+            if "last_provider_status" in diagnostics:
+                status_suffix = f" last_provider_status={diagnostics['last_provider_status']}"
+            print(
+                "CALL-E resolution_error "
+                f"code={code} phase={diagnostics['phase']} "
+                f"call_id_present={'true' if diagnostics['call_id_present'] else 'false'}"
+                f"{status_suffix}",
+                flush=True,
+            )
             try:
                 resolutions.update(
                     resolution_id,
@@ -594,7 +612,7 @@ class Handler(BaseHTTPRequestHandler):
             now_utc=now_utc,
             gdpr_basis_documented=(payload.get("gdpr_basis_documented", False) if live else False),
             poll_interval_seconds=0.01,
-            poll_timeout_seconds=MAX_POLL_SECONDS,
+            poll_timeout_seconds=MAX_LIVE_POLL_SECONDS if live else MAX_POLL_SECONDS,
         )
 
         live_capacity = None

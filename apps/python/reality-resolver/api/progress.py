@@ -37,11 +37,14 @@ from api.serialize import (
     verdict_payload,
 )
 from api.store import ResolutionNotFoundError, ResolutionStore
+from client import sanitize_provider_error_message
 from compliance.models import PreCallDecision
 from evidence.engine import ReasoningResult
 from evidence.model import Case
 from pipeline import Observer
 from verdict import Verdict
+
+_SAFE_PROVIDER_STATUSES = frozenset({"queued", "in_progress", "completed", "failed", "canceled"})
 
 
 class StoreObserver(Observer):
@@ -66,6 +69,30 @@ class StoreObserver(Observer):
         self._applicable: PreCallDecision | None = None
         self._exempted: tuple[str, ...] = ()
         self._next_legal_window: str | None = None
+        # Provider diagnostics stay in this worker-local accumulator. They
+        # are never part of the public resolution projection.
+        self._phase = "preflight"
+        self._call_id_present = False
+        self._last_provider_status: str | None = None
+
+    @staticmethod
+    def _safe_provider_status(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = sanitize_provider_error_message(value)
+        if text in _SAFE_PROVIDER_STATUSES:
+            return text
+        return "unknown"
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return provider-safe worker diagnostics for local logging only."""
+        result: dict[str, Any] = {
+            "phase": self._phase,
+            "call_id_present": self._call_id_present,
+        }
+        if self._last_provider_status is not None:
+            result["last_provider_status"] = self._last_provider_status
+        return result
 
     def _publish(self, patch: dict[str, Any]) -> None:
         """Best-effort. The store is a volatile projection; the pipeline
@@ -97,6 +124,11 @@ class StoreObserver(Observer):
         )
 
     # --- hooks --------------------------------------------------------
+
+    def on_call_preview(self, preview: dict[str, Any]) -> None:
+        # The preview is emitted immediately before the provider client is
+        # constructed and POST /v1/calls begins. Do not retain its contents.
+        self._phase = "create"
 
     def on_start(self, case: Case, mode: str) -> None:
         self._publish(
@@ -138,9 +170,14 @@ class StoreObserver(Observer):
         # unused: it is not a fact about the decision, and it is on the
         # list of things a client never sees. What matters here is that
         # a call now exists, which is what makes "calling" true.
+        self._phase = "poll"
+        self._call_id_present = True
+        self._last_provider_status = self._safe_provider_status(status)
         self._publish({"call": call_projection({"status": status}, placed=True)})
 
     def on_poll(self, call: dict[str, Any]) -> None:
+        self._phase = "poll"
+        self._last_provider_status = self._safe_provider_status(call.get("status"))
         self._publish({"call": call_projection(call, placed=True)})
 
     def on_call_completed(self, call: dict[str, Any]) -> None:
